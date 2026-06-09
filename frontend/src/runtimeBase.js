@@ -1,4 +1,4 @@
-const APP_PREFIX = '/app/fnrmux'
+const APP_PREFIX = '/app/rmux'
 const BUILD_VERSION = import.meta.env.VITE_APP_BUILD_VERSION || ''
 
 const path = window.location.pathname

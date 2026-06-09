@@ -2,8 +2,8 @@
   <div class="login-page">
     <div class="login-wrapper">
       <div class="brand-header">
-        <img class="logo" :src="iconUrl" alt="FnRmux" />
-        <h1>FnRmux</h1>
+        <img class="logo" :src="iconUrl" alt="Rmux" />
+        <h1>Rmux</h1>
         <p class="subtitle" v-if="mode === 'setup'">首次使用：请选择是否设置访问密码</p>
         <p class="subtitle" v-else-if="mode === 'login'">请输入访问密码</p>
         <p class="subtitle" v-else>正在进入终端...</p>
@@ -65,8 +65,8 @@ const error = ref('')
 const loading = ref(false)
 
 const handleLoginSuccess = (data) => {
-  sessionStorage.setItem('fnrmux_token', data.token)
-  sessionStorage.setItem('fnrmux_auth_user', JSON.stringify(data.user))
+  sessionStorage.setItem('rmux_token', data.token)
+  sessionStorage.setItem('rmux_auth_user', JSON.stringify(data.user))
   router.push('/terminal')
 }
 
@@ -92,7 +92,7 @@ const autoEnterPublic = async () => {
   try {
     const res = await axios.get(`${API_BASE}/api/auth/me`)
     if (res.data.success) {
-      sessionStorage.setItem('fnrmux_auth_user', JSON.stringify(res.data.data))
+      sessionStorage.setItem('rmux_auth_user', JSON.stringify(res.data.data))
       router.push('/terminal')
     } else {
       // 理论上 public 模式不应该失败，除非连 me 都拿不到

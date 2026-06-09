@@ -1,4 +1,4 @@
-# FnRmux FPK 打包指南
+# Rmux FPK 打包指南
 
 > 飞牛 fnOS 原生应用打包方法，基于 aicore-web 的 FPK 打包教程实践总结。
 
@@ -8,7 +8,7 @@
 build_fpk/                          # 打包源目录
 ├── app/
 │   ├── server/                     # 后端二进制
-│   │   ├── fnrmux                  # Rust 主程序
+│   │   ├── rmux                  # Rust 主程序
 │   │   ├── bin/
 │   │   │   ├── tmux                # 内置 tmux
 │   │   │   └── sshpass             # 内置 sshpass
@@ -51,16 +51,16 @@ build_fpk/                          # 打包源目录
 **关键：** 不要有多余字段。参考 aicore-web 的精简格式：
 
 ```text
-appname               = fnrmux
+appname               = rmux
 version               = 0.1.0
-display_name          = FnRmux
+display_name          = Rmux
 desc                  = Web 终端管理，支持本地终端，主题自定义
 platform              = x86
 source                = thirdparty
 maintainer            = user-no-found
 distributor           = user-no-found
 desktop_uidir         = ui               # 指向 app/ui/
-desktop_applaunchname = fnrmux.Application
+desktop_applaunchname = rmux.Application
 service_port          = 18732            # 避免使用常见端口
 checkport             = true
 ```
@@ -71,7 +71,7 @@ checkport             = true
 - ❌ 不要加 `os_min_version`
 - ❌ 不要加 `maintainer_url`、`distributor_url`、`helpurl`、`changelog`
 - ⚠️ **版本必须用 `0.0.x` 序列**，不能用 `1.x.x`
-- ⚠️ **每次重新打包前必须手动把版本号第三位 +1**，否则 fnOS 不会覆盖安装旧版本
+- ⚠️ **只有在发布新版本时才手动修改版本号**；需要覆盖同一发布时保持版本号不变
 
 ## 配置文件
 
@@ -94,12 +94,12 @@ checkport             = true
     "data-share": {
         "shares": [
             {
-                "name": "fnrmux",
-                "permission": { "rw": ["fnrmux"] }
+                "name": "rmux",
+                "permission": { "rw": ["rmux"] }
             },
             {
-                "name": "fnrmux/data",
-                "permission": { "rw": ["fnrmux"] }
+                "name": "rmux/data",
+                "permission": { "rw": ["rmux"] }
             }
         ]
     }
@@ -115,7 +115,7 @@ checkport             = true
 ```json
 {
     ".url": {
-        "fnrmux.Application": {
+        "rmux.Application": {
             "title": "终端",
             "icon": "images/icon_{0}.png",
             "type": "url",
@@ -145,24 +145,24 @@ APP_DEST="${TRIM_APPDEST:-${PKG_ROOT}/app}"
 ```
 
 二进制查找路径优先顺序：
-1. `${TRIM_APPDEST}/server/fnrmux`（fnOS 实机路径）
-2. `${PKG_ROOT}/server/fnrmux`（本地模拟 fallback）
+1. `${TRIM_APPDEST}/server/rmux`（fnOS 实机路径）
+2. `${PKG_ROOT}/server/rmux`（本地模拟 fallback）
 
 ## 构建流程
 
 ```bash
 # 1. 编译 Rust 后端
-cd fnrmux/backend
+cd rmux/backend
 cargo build --release
 
 # 2. 编译 Vue 前端
 cd ../frontend
-npm run build          # 输出到 fnrmux/ui/
+npm run build          # 输出到 rmux/ui/
 
 # 3. 用 fnpack 打包
 cd ../build_fpk
 # 确保以下文件到位：
-#   app/server/fnrmux           ← 来自 target/release/fnrmux
+#   app/server/rmux           ← 来自 target/release/rmux
 #   app/www/index.html + assets/  ← 来自 ../ui/
 #   app/ui/config + images/     ← 桌面入口文件
 #   cmd/*                       ← 生命周期脚本
@@ -176,7 +176,7 @@ fnpack build --directory .
 
 # 4. 验证
 # 检查外层 manifest
-mkdir -p /tmp/verify && tar -xzf fnrmux.fpk -C /tmp/verify
+mkdir -p /tmp/verify && tar -xzf rmux.fpk -C /tmp/verify
 cat /tmp/verify/manifest
 # 检查 app.tgz 内容
 tar -tzf /tmp/verify/app.tgz
@@ -192,7 +192,7 @@ tar -tzf /tmp/verify/app.tgz
 | 应用包不符合系统要求 | `config/resource` 为空 `{}` | 用 `data-share` 格式 |
 | 安装成功但启动失败 | cmd/main 路径解析错误 | 优先使用 `TRIM_APPDEST` |
 | 安装成功但无法打开 | app/ui/config 类型或字段错误 | 使用 `type: url` + `url: "/"` |
-| 升级后仍用旧脚本 | 版本号没有递增 | 打包前手动加 1 |
+| 升级后仍用旧脚本 | 发布了新版本但未修改 version | 发布新版本前手动更新 version |
 
 ## 参考
 

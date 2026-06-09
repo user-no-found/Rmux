@@ -25,7 +25,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
-        let data_dir = env::var("TRIM_PKGVAR").unwrap_or_else(|_| "/tmp/fnrmux".to_string());
+        let data_dir = env::var("TRIM_PKGVAR").unwrap_or_else(|_| "/tmp/rmux".to_string());
         let data_dir = PathBuf::from(&data_dir);
 
         let app_dest = env::var("TRIM_APPDEST").unwrap_or_else(|_| ".".to_string());
@@ -40,19 +40,19 @@ impl AppConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
             data_dir: data_dir.clone(),
-            db_path: data_dir.join("fnrmux.db"),
-            jwt_secret_file: data_dir.join("fnrmux_jwt_secret_v2"),
-            auth_file: data_dir.join("fnrmux_auth.json"),
+            db_path: data_dir.join("rmux.db"),
+            jwt_secret_file: data_dir.join("rmux_jwt_secret_v2"),
+            auth_file: data_dir.join("rmux_auth.json"),
             skip_auth_file: data_dir.join(".skip_auth"),
-            session_file: data_dir.join("fnrmux_sessions.json"),
+            session_file: data_dir.join("rmux_sessions.json"),
             backgrounds_dir: data_dir.join("backgrounds"),
             outputs_dir: data_dir.join("outputs"),
             logs_dir: data_dir.join("logs"),
             sessions_dir: data_dir.join("sessions"),
             ui_dir: PathBuf::from(&app_dest).join("www"),
-            socket_path: PathBuf::from("/tmp/fnrmux_socks"),
-            clipboard_dir: PathBuf::from("/tmp/fnrmux_clipboard"),
-            log_file: data_dir.join("fnrmux.log"),
+            socket_path: PathBuf::from("/tmp/rmux_socks"),
+            clipboard_dir: PathBuf::from("/tmp/rmux_clipboard"),
+            log_file: data_dir.join("rmux.log"),
         }
     }
 

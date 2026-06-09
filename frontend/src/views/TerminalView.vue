@@ -77,7 +77,7 @@
 
       <section class="terminal-viewport" ref="termContainer">
         <div v-if="sessions.length === 0" class="empty-state">
-          <div class="empty-title">FnRmux</div>
+          <div class="empty-title">Rmux</div>
           <div class="empty-line">没有正在运行的终端会话</div>
           <button class="primary-command" @click="createNewSession">开启本地终端</button>
         </div>
@@ -85,6 +85,7 @@
         <div
           v-for="s in sessions"
           :key="s.session_id"
+          :data-session-id="s.session_id"
           :class="['term-wrapper', { active: activeSession === s.session_id }]"
           :ref="el => setTermRef(s.session_id, el)"
         ></div>
@@ -98,8 +99,8 @@
         </div>
         <div class="status-center">
           <span class="repo-label">仓库地址:</span>
-          <a :href="repoHref" target="_blank" rel="noopener noreferrer" title="https://github.com/user-no-found/FnRmux">
-            https://github.com/user-no-found/FnRmux
+          <a :href="repoHref" target="_blank" rel="noopener noreferrer" title="https://github.com/user-no-found/Rmux">
+            https://github.com/user-no-found/Rmux
           </a>
         </div>
         <div class="status-right">
@@ -132,9 +133,11 @@ const termRefs = reactive({})
 const termInstances = reactive({})
 const fitAddons = reactive({})
 const wsConnections = reactive({})
+const pendingTermWrites = {}
+const writeFrameIds = {}
 const toastMsg = ref('')
 const systemInfo = ref({ hostname: 'localhost', os: 'Linux', arch: 'x86_64' })
-const repoHref = 'https://github.com/user-no-found/FnRmux'
+const repoHref = 'https://github.com/user-no-found/Rmux'
 const clipboardOpen = ref(false)
 const clipboardHistory = ref([])
 const editingSession = ref(null)
@@ -143,9 +146,129 @@ const renameInputRefs = reactive({})
 
 const dotClasses = ['online', 'blue', 'purple', 'orange']
 const CLIPBOARD_HISTORY_LIMIT = 20
+const MAX_TEXT_HISTORY_CHARS = 100000
+const MAX_TERMINAL_WRITE_CHARS = 128 * 1024
+const SESSION_REFRESH_MS = 15000
+const COMBINING_CODEPOINT_RANGES = [
+  [0x0300, 0x036f], [0x0483, 0x0489], [0x0591, 0x05bd], [0x05bf, 0x05bf],
+  [0x05c1, 0x05c2], [0x05c4, 0x05c5], [0x05c7, 0x05c7], [0x0610, 0x061a],
+  [0x064b, 0x065f], [0x0670, 0x0670], [0x06d6, 0x06dc], [0x06df, 0x06e4],
+  [0x06e7, 0x06e8], [0x06ea, 0x06ed], [0x0711, 0x0711], [0x0730, 0x074a],
+  [0x07a6, 0x07b0], [0x07eb, 0x07f3], [0x0816, 0x0819], [0x081b, 0x0823],
+  [0x0825, 0x0827], [0x0829, 0x082d], [0x0859, 0x085b], [0x08d3, 0x08e1],
+  [0x08e3, 0x0902], [0x093a, 0x093a], [0x093c, 0x093c], [0x0941, 0x0948],
+  [0x094d, 0x094d], [0x0951, 0x0957], [0x0962, 0x0963], [0x0981, 0x0981],
+  [0x09bc, 0x09bc], [0x09c1, 0x09c4], [0x09cd, 0x09cd], [0x09e2, 0x09e3],
+  [0x0a01, 0x0a02], [0x0a3c, 0x0a3c], [0x0a41, 0x0a42], [0x0a47, 0x0a48],
+  [0x0a4b, 0x0a4d], [0x0a51, 0x0a51], [0x0a70, 0x0a71], [0x0a75, 0x0a75],
+  [0x0a81, 0x0a82], [0x0abc, 0x0abc], [0x0ac1, 0x0ac5], [0x0ac7, 0x0ac8],
+  [0x0acd, 0x0acd], [0x0ae2, 0x0ae3], [0x0afa, 0x0aff], [0x0b01, 0x0b01],
+  [0x0b3c, 0x0b3c], [0x0b3f, 0x0b3f], [0x0b41, 0x0b44], [0x0b4d, 0x0b4d],
+  [0x0b56, 0x0b56], [0x0b62, 0x0b63], [0x0b82, 0x0b82], [0x0bc0, 0x0bc0],
+  [0x0bcd, 0x0bcd], [0x0c00, 0x0c00], [0x0c04, 0x0c04], [0x0c3e, 0x0c40],
+  [0x0c46, 0x0c48], [0x0c4a, 0x0c4d], [0x0c55, 0x0c56], [0x0c62, 0x0c63],
+  [0x0c81, 0x0c81], [0x0cbc, 0x0cbc], [0x0cbf, 0x0cbf], [0x0cc6, 0x0cc6],
+  [0x0ccc, 0x0ccd], [0x0ce2, 0x0ce3], [0x0d00, 0x0d01], [0x0d3b, 0x0d3c],
+  [0x0d41, 0x0d44], [0x0d4d, 0x0d4d], [0x0d62, 0x0d63], [0x0dca, 0x0dca],
+  [0x0dd2, 0x0dd4], [0x0dd6, 0x0dd6], [0x0e31, 0x0e31], [0x0e34, 0x0e3a],
+  [0x0e47, 0x0e4e], [0x0eb1, 0x0eb1], [0x0eb4, 0x0eb9], [0x0ebb, 0x0ebc],
+  [0x0ec8, 0x0ecd], [0x0f18, 0x0f19], [0x0f35, 0x0f35], [0x0f37, 0x0f37],
+  [0x0f39, 0x0f39], [0x0f71, 0x0f7e], [0x0f80, 0x0f84], [0x0f86, 0x0f87],
+  [0x0f8d, 0x0f97], [0x0f99, 0x0fbc], [0x0fc6, 0x0fc6], [0x102d, 0x1030],
+  [0x1032, 0x1037], [0x1039, 0x103a], [0x103d, 0x103e], [0x1058, 0x1059],
+  [0x105e, 0x1060], [0x1071, 0x1074], [0x1082, 0x1082], [0x1085, 0x1086],
+  [0x108d, 0x108d], [0x109d, 0x109d], [0x1160, 0x11ff], [0x135d, 0x135f],
+  [0x1712, 0x1714], [0x1732, 0x1734], [0x1752, 0x1753], [0x1772, 0x1773],
+  [0x17b4, 0x17b5], [0x17b7, 0x17bd], [0x17c6, 0x17c6], [0x17c9, 0x17d3],
+  [0x17dd, 0x17dd], [0x180b, 0x180f], [0x1885, 0x1886], [0x18a9, 0x18a9],
+  [0x1920, 0x1922], [0x1927, 0x1928], [0x1932, 0x1932], [0x1939, 0x193b],
+  [0x1a17, 0x1a18], [0x1a1b, 0x1a1b], [0x1a56, 0x1a56], [0x1a58, 0x1a5e],
+  [0x1a60, 0x1a60], [0x1a62, 0x1a62], [0x1a65, 0x1a6c], [0x1a73, 0x1a7c],
+  [0x1a7f, 0x1a7f], [0x1ab0, 0x1ace], [0x1b00, 0x1b03], [0x1b34, 0x1b34],
+  [0x1b36, 0x1b3a], [0x1b3c, 0x1b3c], [0x1b42, 0x1b42], [0x1b6b, 0x1b73],
+  [0x1b80, 0x1b81], [0x1ba2, 0x1ba5], [0x1ba8, 0x1ba9], [0x1bab, 0x1bad],
+  [0x1be6, 0x1be6], [0x1be8, 0x1be9], [0x1bed, 0x1bed], [0x1bef, 0x1bf1],
+  [0x1c2c, 0x1c33], [0x1c36, 0x1c37], [0x1cd0, 0x1cd2], [0x1cd4, 0x1ce0],
+  [0x1ce2, 0x1ce8], [0x1ced, 0x1ced], [0x1cf4, 0x1cf4], [0x1cf8, 0x1cf9],
+  [0x1dc0, 0x1dff], [0x200b, 0x200f], [0x202a, 0x202e], [0x2060, 0x2064],
+  [0x2066, 0x206f], [0x20d0, 0x20f0], [0x2cef, 0x2cf1], [0x2d7f, 0x2d7f],
+  [0x2de0, 0x2dff], [0x302a, 0x302f], [0x3099, 0x309a], [0xa66f, 0xa672],
+  [0xa674, 0xa67d], [0xa69e, 0xa69f], [0xa6f0, 0xa6f1], [0xa802, 0xa802],
+  [0xa806, 0xa806], [0xa80b, 0xa80b], [0xa825, 0xa826], [0xa8c4, 0xa8c5],
+  [0xa8e0, 0xa8f1], [0xa926, 0xa92d], [0xa947, 0xa951], [0xa980, 0xa982],
+  [0xa9b3, 0xa9b3], [0xa9b6, 0xa9b9], [0xa9bc, 0xa9bc], [0xa9e5, 0xa9e5],
+  [0xaa29, 0xaa2e], [0xaa31, 0xaa32], [0xaa35, 0xaa36], [0xaa43, 0xaa43],
+  [0xaa4c, 0xaa4c], [0xaa7c, 0xaa7c], [0xaab0, 0xaab0], [0xaab2, 0xaab4],
+  [0xaab7, 0xaab8], [0xaabe, 0xaabf], [0xaac1, 0xaac1], [0xaaec, 0xaaed],
+  [0xaaf6, 0xaaf6], [0xabe5, 0xabe5], [0xabe8, 0xabe8], [0xabed, 0xabed],
+  [0xfb1e, 0xfb1e], [0xfe00, 0xfe0f], [0xfe20, 0xfe2f], [0xfeff, 0xfeff],
+  [0xfff9, 0xfffb], [0x101fd, 0x101fd], [0x102e0, 0x102e0], [0x10376, 0x1037a],
+  [0x10a01, 0x10a03], [0x10a05, 0x10a06], [0x10a0c, 0x10a0f], [0x10a38, 0x10a3a],
+  [0x10a3f, 0x10a3f], [0x10ae5, 0x10ae6], [0x11001, 0x11001], [0x11038, 0x11046],
+  [0x1107f, 0x11081], [0x110b3, 0x110b6], [0x110b9, 0x110ba], [0x11100, 0x11102],
+  [0x11127, 0x1112b], [0x1112d, 0x11134], [0x11173, 0x11173], [0x11180, 0x11181],
+  [0x111b6, 0x111be], [0x111c9, 0x111cc], [0x1122f, 0x11231], [0x11234, 0x11234],
+  [0x11236, 0x11237], [0x1123e, 0x1123e], [0x112df, 0x112df], [0x112e3, 0x112ea],
+  [0x11300, 0x11301], [0x1133b, 0x1133c], [0x11340, 0x11340], [0x11366, 0x1136c],
+  [0x11370, 0x11374], [0x11438, 0x1143f], [0x11442, 0x11444], [0x11446, 0x11446],
+  [0x1145e, 0x1145e], [0x114b3, 0x114b8], [0x114ba, 0x114ba], [0x114bf, 0x114c0],
+  [0x114c2, 0x114c3], [0x115b2, 0x115b5], [0x115bc, 0x115bd], [0x115bf, 0x115c0],
+  [0x115dc, 0x115dd], [0x11633, 0x1163a], [0x1163d, 0x1163d], [0x1163f, 0x11640],
+  [0x116ab, 0x116ab], [0x116ad, 0x116ad], [0x116b0, 0x116b5], [0x116b7, 0x116b7],
+  [0x1171d, 0x1171f], [0x11722, 0x11725], [0x11727, 0x1172b], [0x1182f, 0x11837],
+  [0x11839, 0x1183a], [0x1193b, 0x1193c], [0x1193e, 0x1193e], [0x11943, 0x11943],
+  [0x119d4, 0x119d7], [0x119da, 0x119db], [0x119e0, 0x119e0], [0x11a01, 0x11a0a],
+  [0x11a33, 0x11a38], [0x11a3b, 0x11a3e], [0x11a47, 0x11a47], [0x11a51, 0x11a56],
+  [0x11a59, 0x11a5b], [0x11a8a, 0x11a96], [0x11a98, 0x11a99], [0x11c30, 0x11c36],
+  [0x11c38, 0x11c3d], [0x11c3f, 0x11c3f], [0x11c92, 0x11ca7], [0x11caa, 0x11cb0],
+  [0x11cb2, 0x11cb3], [0x11cb5, 0x11cb6], [0x11d31, 0x11d36], [0x11d3a, 0x11d3a],
+  [0x11d3c, 0x11d3d], [0x11d3f, 0x11d45], [0x11d47, 0x11d47], [0x11d90, 0x11d91],
+  [0x11d95, 0x11d95], [0x11d97, 0x11d97], [0x11ef3, 0x11ef4], [0x13430, 0x13438],
+  [0x16af0, 0x16af4], [0x16b30, 0x16b36], [0x16f4f, 0x16f4f], [0x16f8f, 0x16f92],
+  [0x16fe4, 0x16fe4], [0x1bc9d, 0x1bc9e], [0x1d167, 0x1d169], [0x1d17b, 0x1d182],
+  [0x1d185, 0x1d18b], [0x1d1aa, 0x1d1ad], [0x1d242, 0x1d244], [0x1da00, 0x1da36],
+  [0x1da3b, 0x1da6c], [0x1da75, 0x1da75], [0x1da84, 0x1da84], [0x1da9b, 0x1da9f],
+  [0x1daa1, 0x1daaf], [0x1e000, 0x1e006], [0x1e008, 0x1e018], [0x1e01b, 0x1e021],
+  [0x1e023, 0x1e024], [0x1e026, 0x1e02a], [0x1e130, 0x1e136], [0x1e2ae, 0x1e2ae],
+  [0x1e2ec, 0x1e2ef], [0x1e8d0, 0x1e8d6], [0x1e944, 0x1e94a], [0xe0100, 0xe01ef],
+]
+
+const WIDE_CODEPOINT_RANGES = [
+  [0x1100, 0x115f], [0x2329, 0x232a], [0x2e80, 0xa4cf], [0xac00, 0xd7a3],
+  [0xf900, 0xfaff], [0xfe10, 0xfe19], [0xfe30, 0xfe6f], [0xff00, 0xff60],
+  [0xffe0, 0xffe6], [0x20000, 0x2fffd], [0x30000, 0x3fffd],
+]
+
+const EMOJI_WIDE_CODEPOINT_RANGES = [
+  [0x2600, 0x27bf], [0x1f000, 0x1f02f], [0x1f0a0, 0x1f0ff], [0x1f100, 0x1f1ff],
+  [0x1f300, 0x1f5ff], [0x1f600, 0x1f64f], [0x1f680, 0x1f6ff], [0x1f700, 0x1f77f],
+  [0x1f780, 0x1f7ff], [0x1f800, 0x1f8ff], [0x1f900, 0x1f9ff], [0x1fa70, 0x1faff],
+]
+
+const codepointInRanges = (codepoint, ranges) => ranges.some(([start, end]) => codepoint >= start && codepoint <= end)
+
+const emojiAwareUnicodeProvider = {
+  version: 'rmux-emoji',
+  wcwidth(codepoint) {
+    if (codepoint === 0) return 0
+    if (codepoint < 32 || (codepoint >= 0x7f && codepoint < 0xa0)) return 0
+    if (codepoint === 0x200d || (codepoint >= 0x1f3fb && codepoint <= 0x1f3ff)) return 0
+    if (codepointInRanges(codepoint, COMBINING_CODEPOINT_RANGES)) return 0
+    if (codepointInRanges(codepoint, EMOJI_WIDE_CODEPOINT_RANGES)) return 2
+    if (codepointInRanges(codepoint, WIDE_CODEPOINT_RANGES) && codepoint !== 0x303f) return 2
+    return 1
+  },
+}
+
+const configureTerminalUnicode = (term) => {
+  try {
+    term.unicode.register(emojiAwareUnicodeProvider)
+    term.unicode.activeVersion = emojiAwareUnicodeProvider.version
+  } catch (e) {}
+}
 
 const authHeaders = () => {
-  const token = sessionStorage.getItem('fnrmux_token')
+  const token = sessionStorage.getItem('rmux_token')
   return token ? { headers: { Authorization: 'Bearer ' + token } } : { headers: {} }
 }
 
@@ -179,14 +302,16 @@ const setRenameInputRef = (id, el) => {
   if (el) renameInputRefs[id] = el
 }
 
-const sendTerminalInput = (data) => {
-  const ws = wsConnections[activeSession.value]
+const sendTerminalMessage = (type, data, sessionId = activeSession.value) => {
+  const ws = wsConnections[sessionId]
   if (data && ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'input', data }))
+    ws.send(JSON.stringify({ type, data }))
     return true
   }
   return false
 }
+
+const sendTerminalPaste = (data, sessionId = activeSession.value) => sendTerminalMessage('paste', data, sessionId)
 
 const shellQuotePath = (path) => `'${String(path).replace(/'/g, `'\\''`)}'`
 
@@ -231,11 +356,8 @@ const mergeSessionList = (incoming) => {
   return [...merged, ...additions]
 }
 
-const insertSessionAfterActive = (session) => {
-  const activeIndex = sessions.value.findIndex(s => s.session_id === activeSession.value)
-  if (activeIndex >= 0) {
-    sessions.value.splice(activeIndex + 1, 0, session)
-  } else {
+const appendSession = (session) => {
+  if (!sessions.value.some(s => s.session_id === session.session_id)) {
     sessions.value.push(session)
   }
 }
@@ -247,6 +369,10 @@ const toggleClipboard = async () => {
 }
 
 const recordClipboardItem = async (item) => {
+  if (item.kind === 'text' && normalizeClipboardText(item.text).length > MAX_TEXT_HISTORY_CHARS) {
+    return
+  }
+
   const fallback = {
     ...item,
     id: item.id || makeClipboardId(),
@@ -306,18 +432,19 @@ const formatClipboardTime = (value) => {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-const pasteText = (text, { record = true } = {}) => {
+const pasteText = (text, { record = true, sessionId = activeSession.value } = {}) => {
   const normalized = normalizeClipboardText(text)
   if (!normalized) {
     showToast('剪切板没有文本')
     return false
   }
-  if (!sendTerminalInput(normalized)) {
+  if (!sendTerminalPaste(normalized, sessionId)) {
     showToast('没有可用终端')
     return false
   }
-  if (record) recordClipboardItem({ kind: 'text', text: normalized })
-  showToast('已粘贴文本')
+  const shouldRecord = record && normalized.length <= MAX_TEXT_HISTORY_CHARS
+  if (shouldRecord) recordClipboardItem({ kind: 'text', text: normalized })
+  showToast(shouldRecord ? '已粘贴文本' : '已粘贴文本，内容较长未加入历史')
   return true
 }
 
@@ -329,12 +456,12 @@ const uploadClipboardImage = async (blob) => {
   return res.data?.data?.files?.[0]?.path || ''
 }
 
-const pasteImagePath = (path, { recordItem = null } = {}) => {
+const pasteImagePath = (path, { recordItem = null, sessionId = activeSession.value } = {}) => {
   if (!path) {
     showToast('图片路径无效')
     return false
   }
-  if (!sendTerminalInput(`${shellQuotePath(path)} `)) {
+  if (!sendTerminalPaste(`${shellQuotePath(path)} `, sessionId)) {
     showToast('没有可用终端')
     return false
   }
@@ -343,13 +470,14 @@ const pasteImagePath = (path, { recordItem = null } = {}) => {
   return true
 }
 
-const pasteImageBlob = async (blob) => {
-  if (!activeSession.value || !blob) return
+const pasteImageBlob = async (blob, { sessionId = activeSession.value } = {}) => {
+  if (!sessionId || !blob) return
   showToast('图片已保存，正在输入路径...')
   try {
     const path = await uploadClipboardImage(blob)
     if (path) {
       pasteImagePath(path, {
+        sessionId,
         recordItem: {
           kind: 'image',
           path,
@@ -379,18 +507,102 @@ const isEditableTarget = (target) => {
   return Boolean(el.closest('input, textarea, select, [contenteditable="true"]'))
 }
 
+const sessionIdFromEvent = (e) => {
+  const el = e?.target instanceof Element ? e.target : null
+  return el?.closest('.term-wrapper')?.dataset?.sessionId || activeSession.value
+}
+
 const handledPasteEvents = new WeakSet()
+let pendingShortcutPasteMode = null
+let pendingShortcutPasteSessionId = null
+let pendingShortcutPasteTimer = null
+let suppressCtrlVInputUntil = 0
+
+const clearPendingShortcutPaste = () => {
+  pendingShortcutPasteMode = null
+  pendingShortcutPasteSessionId = null
+  if (pendingShortcutPasteTimer) {
+    clearTimeout(pendingShortcutPasteTimer)
+    pendingShortcutPasteTimer = null
+  }
+}
+
+const isPasteShortcut = (e) => {
+  const key = String(e.key || '').toLowerCase()
+  return key === 'v' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey
+}
+
+const pasteClipboardText = async ({ quiet = false, sessionId = activeSession.value } = {}) => {
+  try {
+    const text = await navigator.clipboard?.readText?.()
+    if (!text && quiet) return
+    pasteText(text || '', { sessionId })
+  } catch (e) {
+    if (!quiet) {
+      showToast('文本粘贴失败: ' + (e.message || '请检查浏览器剪切板权限'))
+    }
+  }
+}
+
+const armPasteFallback = (sessionId = activeSession.value) => {
+  clearPendingShortcutPaste()
+  pendingShortcutPasteMode = 'paste'
+  pendingShortcutPasteSessionId = sessionId
+  suppressCtrlVInputUntil = Date.now() + 1500
+  pendingShortcutPasteTimer = setTimeout(async () => {
+    if (pendingShortcutPasteMode !== 'paste') return
+    const targetSessionId = pendingShortcutPasteSessionId
+    clearPendingShortcutPaste()
+    await pasteClipboardText({ quiet: true, sessionId: targetSessionId })
+  }, 350)
+}
+
+const handlePasteShortcut = (e, sessionId = sessionIdFromEvent(e)) => {
+  if (e.type !== 'keydown') return false
+  if (isEditableTarget(e.target)) return false
+
+  if (isPasteShortcut(e)) {
+    armPasteFallback(sessionId)
+    return true
+  }
+
+  return false
+}
+
+const handleGlobalPasteKeydown = (e) => {
+  if (e.defaultPrevented || isEditableTarget(e.target)) return
+  const sessionId = sessionIdFromEvent(e)
+  if (!sessionId) return
+
+  if (isPasteShortcut(e)) {
+    armPasteFallback(sessionId)
+  }
+}
+
 const handlePaste = (e) => {
   if (handledPasteEvents.has(e)) return
   handledPasteEvents.add(e)
 
   if (isEditableTarget(e.target)) return
 
+  const mode = pendingShortcutPasteMode
+  const sessionId = pendingShortcutPasteSessionId || sessionIdFromEvent(e)
+  if (mode) clearPendingShortcutPaste()
+
+  if (mode === 'paste') {
+    e.preventDefault()
+    e.stopPropagation()
+    const imageBlob = imageBlobFromPasteItems(e.clipboardData?.items)
+    if (imageBlob) pasteImageBlob(imageBlob, { sessionId })
+    else pasteText(e.clipboardData?.getData('text/plain') || '', { sessionId })
+    return
+  }
+
   const imageBlob = imageBlobFromPasteItems(e.clipboardData?.items)
   if (imageBlob) {
     e.preventDefault()
     e.stopPropagation()
-    pasteImageBlob(imageBlob)
+    pasteImageBlob(imageBlob, { sessionId })
     return
   }
 
@@ -399,7 +611,7 @@ const handlePaste = (e) => {
 
   e.preventDefault()
   e.stopPropagation()
-  pasteText(text)
+  pasteText(text, { sessionId })
 }
 
 const loadSystemInfo = async () => {
@@ -407,6 +619,33 @@ const loadSystemInfo = async () => {
     const res = await axios.get(`${API_BASE}/api/system/info`, authHeaders())
     if (res.data.success) systemInfo.value = res.data.data
   } catch (e) {}
+}
+
+const scheduleTerminalFlush = (id) => {
+  if (!termInstances[id] || writeFrameIds[id]) return
+
+  writeFrameIds[id] = requestAnimationFrame(() => {
+    delete writeFrameIds[id]
+    const term = termInstances[id]
+    const pending = pendingTermWrites[id] || ''
+    if (!term || !pending) {
+      pendingTermWrites[id] = ''
+      return
+    }
+
+    const chunk = pending.slice(0, MAX_TERMINAL_WRITE_CHARS)
+    pendingTermWrites[id] = pending.slice(chunk.length)
+    term.write(chunk, () => {
+      if (pendingTermWrites[id] && termInstances[id]) scheduleTerminalFlush(id)
+    })
+  })
+}
+
+const writeTerminalData = (id, data) => {
+  if (!termInstances[id] || !data) return
+
+  pendingTermWrites[id] = (pendingTermWrites[id] || '') + data
+  scheduleTerminalFlush(id)
 }
 
 const loadSessions = async () => {
@@ -434,7 +673,7 @@ const initTerminal = async (id) => {
     lineHeight: 1.35,
     scrollback: 2000,
     allowProposedApi: true,
-    convertEol: true,
+    convertEol: false,
     linkHandler: {
       activate: (_event, text) => openSafeUrl(text),
       allowNonHttpProtocols: false,
@@ -464,6 +703,7 @@ const initTerminal = async (id) => {
   })
 
   const fitAddon = new FitAddon()
+  configureTerminalUnicode(term)
   term.loadAddon(fitAddon)
   term.open(el)
   registerUrlLinks(term)
@@ -471,7 +711,7 @@ const initTerminal = async (id) => {
   termInstances[id] = term
   fitAddons[id] = fitAddon
 
-  const token = sessionStorage.getItem('fnrmux_token') || ''
+  const token = sessionStorage.getItem('rmux_token') || ''
   const ws = new WebSocket(`${WS_BASE}/ws/terminal/${id}?token=${encodeURIComponent(token)}`)
   wsConnections[id] = ws
 
@@ -492,12 +732,19 @@ const initTerminal = async (id) => {
       term.write('\r\n\x1b[31m[会话已结束]\x1b[0m')
       return
     }
-    term.write(e.data)
+    writeTerminalData(id, e.data)
   }
-  ws.onclose = () => term.write('\r\n\x1b[31m[连接已断开]\x1b[0m')
+  ws.onclose = () => {
+    if (termInstances[id]) {
+      term.write('\r\n\x1b[31m[连接已断开]\x1b[0m')
+    }
+  }
 
   term.onData((data) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data }))
+    if (data === '\x16' && Date.now() < suppressCtrlVInputUntil) {
+      return
+    }
+    sendTerminalMessage('input', data, id)
   })
 
   let resizeTimer = null
@@ -516,11 +763,14 @@ const initTerminal = async (id) => {
       term.clearSelection()
       showToast('已复制')
     } else {
-      await pasteClipboard()
+      await pasteClipboard(id)
     }
   })
 
   term.attachCustomKeyEventHandler((e) => {
+    if (handlePasteShortcut(e, id)) {
+      return false
+    }
     if (e.type === 'keydown' && e.ctrlKey && e.key === 'Enter') {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data: '\n' }))
       return false
@@ -567,7 +817,7 @@ const createNewSession = async () => {
     const res = await axios.post(`${API_BASE}/api/sessions`, { type: 'local', cols, rows }, authHeaders())
     if (res.data.success) {
       const newSess = res.data.data
-      insertSessionAfterActive(newSess)
+      appendSession(newSess)
       activeSession.value = newSess.session_id
       await nextTick()
       await initTerminal(newSess.session_id)
@@ -590,6 +840,11 @@ const closeSession = async (id) => {
     delete termInstances[id]
   }
   if (fitAddons[id]) delete fitAddons[id]
+  if (writeFrameIds[id]) {
+    cancelAnimationFrame(writeFrameIds[id])
+    delete writeFrameIds[id]
+  }
+  delete pendingTermWrites[id]
   sessions.value = sessions.value.filter(s => s.session_id !== id)
   if (activeSession.value === id) activeSession.value = sessions.value[0]?.session_id || null
 }
@@ -688,14 +943,14 @@ const copySelection = async () => {
   showToast('已复制')
 }
 
-const pasteClipboard = async () => {
+const pasteClipboard = async (sessionId = activeSession.value) => {
   try {
     if (navigator.clipboard?.read) {
       const items = await navigator.clipboard.read()
       for (const item of items) {
         const imageType = item.types.find(type => type.startsWith('image/'))
         if (imageType) {
-          await pasteImageBlob(await item.getType(imageType))
+          await pasteImageBlob(await item.getType(imageType), { sessionId })
           return
         }
       }
@@ -703,20 +958,20 @@ const pasteClipboard = async () => {
 
     if (navigator.clipboard?.readText) {
       const text = await navigator.clipboard.readText()
-      pasteText(text)
+      pasteText(text, { sessionId })
     }
   } catch (e) {
-    showToast('粘贴失败: ' + (e.response?.data?.message || e.message || '请使用 Ctrl+V 粘贴'))
+    showToast('粘贴失败: ' + (e.response?.data?.message || e.message || '请使用浏览器粘贴'))
   }
 }
 
 const pasteClipboardHistoryItem = (item) => {
   if (item.kind === 'image') {
-    if (pasteImagePath(item.path, { recordItem: item })) clipboardOpen.value = false
+    if (pasteImagePath(item.path, { recordItem: item, sessionId: activeSession.value })) clipboardOpen.value = false
     return
   }
 
-  if (pasteText(item.text, { record: false })) {
+  if (pasteText(item.text, { record: false, sessionId: activeSession.value })) {
     recordClipboardItem(item)
     clipboardOpen.value = false
   }
@@ -742,9 +997,9 @@ onMounted(async () => {
   loadClipboardHistory()
   await Promise.all([loadSessions(), loadSystemInfo()])
   window.addEventListener('resize', handleResize)
+  window.addEventListener('keydown', handleGlobalPasteKeydown, true)
   window.addEventListener('paste', handlePaste, true)
-  document.addEventListener('paste', handlePaste, true)
-  sessionRefreshTimer = setInterval(loadSessions, 3000)
+  sessionRefreshTimer = setInterval(loadSessions, SESSION_REFRESH_MS)
   if (activeSession.value) {
     await nextTick()
     await initTerminal(activeSession.value)
@@ -753,9 +1008,11 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  window.removeEventListener('keydown', handleGlobalPasteKeydown, true)
   window.removeEventListener('paste', handlePaste, true)
-  document.removeEventListener('paste', handlePaste, true)
+  clearPendingShortcutPaste()
   clearInterval(sessionRefreshTimer)
+  Object.values(writeFrameIds).forEach(id => cancelAnimationFrame(id))
   Object.values(wsConnections).forEach(ws => ws.close())
   Object.values(termInstances).forEach(t => t.dispose())
 })
@@ -1019,6 +1276,7 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 0 14px;
   border-bottom: 1px solid var(--line);
   color: #edf3f8;
@@ -1026,8 +1284,13 @@ button {
 }
 
 .clipboard-close {
-  width: 30px;
-  height: 30px;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   border: 0;
   border-radius: 6px;
   color: var(--muted);

@@ -5,10 +5,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PKG_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 APP_DEST="${TRIM_APPDEST:-${PKG_ROOT}}"
 PKG_VAR="${TRIM_PKGVAR:-${PKG_ROOT}/var}"
-LOG_FILE="${PKG_VAR}/fnrmux.log"
-PID_FILE="${PKG_VAR}/fnrmux.pid"
+LOG_FILE="${PKG_VAR}/rmux.log"
+PID_FILE="${PKG_VAR}/rmux.pid"
 PORT="${TRIM_SERVICE_PORT:-18732}"
-APP_NAME="fnrmux"
+APP_NAME="rmux"
 
 log_msg() {
     mkdir -p "$(dirname "${LOG_FILE}")"
@@ -22,8 +22,8 @@ check_process() {
 
 resolve_app_bin() {
     for path in \
-        "${APP_DEST}/server/fnrmux" \
-        "${PKG_ROOT}/server/fnrmux"
+        "${APP_DEST}/server/rmux" \
+        "${PKG_ROOT}/server/rmux"
     do
         if [ -x "${path}" ]; then
             printf "%s" "${path}"
@@ -74,7 +74,7 @@ stop_stale_processes() {
 
 start_process() {
     if status_process; then
-        log_msg "FnRmux 已在运行。"
+        log_msg "Rmux 已在运行。"
         return 0
     fi
 
@@ -86,7 +86,7 @@ start_process() {
         return 1
     fi
 
-    log_msg "启动 FnRmux：端口 ${PORT}"
+    log_msg "启动 Rmux：端口 ${PORT}"
 
     # 设置 tmux 运行环境
     export PATH="${APP_DEST}/server/bin:${PATH}"
@@ -101,7 +101,7 @@ start_process() {
     for i in {1..15}; do
         sleep 0.3
         if status_process; then
-            log_msg "FnRmux 已启动 (PID: $(cat "${PID_FILE}"))"
+            log_msg "Rmux 已启动 (PID: $(cat "${PID_FILE}"))"
             return 0
         fi
     done
@@ -111,9 +111,9 @@ start_process() {
 }
 
 stop_process() {
-    log_msg "停止 FnRmux。"
+    log_msg "停止 Rmux。"
     stop_stale_processes
-    log_msg "FnRmux 已停止"
+    log_msg "Rmux 已停止"
     return 0
 }
 

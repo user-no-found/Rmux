@@ -1,8 +1,8 @@
 [package]
-name = "fnrmux"
+name = "rmux"
 version = "0.0.1"
 edition = "2021"
-description = "FnRmux - Web terminal with SSH/tmux"
+description = "Rmux - Web terminal with SSH/tmux"
 
 [dependencies]
 # Web framework

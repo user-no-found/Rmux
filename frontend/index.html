@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FnRmux</title>
+  <title>Rmux</title>
   <link rel="icon" type="image/png" href="./icon.png?v=%VITE_APP_BUILD_VERSION%">
   <script>
     (function(){
       var uid = 'unknown';
       try {
-        var raw = sessionStorage.getItem('fnrmux_auth_user');
+        var raw = sessionStorage.getItem('rmux_auth_user');
         if (raw) uid = String(JSON.parse(raw).uid || 'unknown');
       } catch(_) {}
-      var modeKey = 'fnrmux_theme_mode:' + uid;
-      var mode = localStorage.getItem(modeKey) || localStorage.getItem('fnrmux_theme_mode:last') || 'auto';
+      var modeKey = 'rmux_theme_mode:' + uid;
+      var mode = localStorage.getItem(modeKey) || localStorage.getItem('rmux_theme_mode:last') || 'auto';
       var effective = mode === 'dark' ? 'dark' : mode === 'light' ? 'light' : null;
       if (!effective) effective = window.matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', effective);

@@ -234,9 +234,9 @@ def main():
     }
     for size in (16, 24, 32, 48, 64, 72, 96, 128, 256):
         targets[f"build_fpk/app/ui/images/icon_{size}.png"] = size
-        targets[f"build_fpk/app/ui/images/fnrumx_{size}.png"] = size
+        targets[f"build_fpk/app/ui/images/rmux_{size}.png"] = size
     targets["build_fpk/app/ui/images/icon_{0}.png"] = 256
-    targets["build_fpk/app/ui/images/fnrumx_{0}.png"] = 256
+    targets["build_fpk/app/ui/images/rmux_{0}.png"] = 256
 
     for rel, size in targets.items():
         path = os.path.join(ROOT, rel)

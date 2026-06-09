@@ -1,4 +1,4 @@
-# FnRmux · 飞牛 fnOS Web 终端
+# Rmux · 飞牛 fnOS Web 终端
 
 为飞牛 fnOS 打造的浏览器终端应用，解决「在 NAS 上用 Web 终端跑 CLI 工具」时的两个体验问题。
 
@@ -38,7 +38,7 @@
 
 ## 安装使用
 
-1. 本地手动安装 `fnrmux.fpk`
+1. 本地手动安装 `rmux.fpk`
 2. 安装后从 fnOS 桌面点击「**终端**」图标启动
 3. 首次启动可选择设置访问密码，或跳过进入公开模式
 4. 默认服务端口：`18732`
@@ -51,14 +51,14 @@
 ```
 
 构建脚本会依次完成：生成图标 → 编译 Rust 后端 → 编译 Vue 前端 → 同步文件 → `fnpack` 打包。
-产物输出在 `build_fpk/fnrmux.fpk`。
+产物输出在 `build_fpk/rmux.fpk`。
 
-> ⚠️ 每次重新打包前，需要手动把 `build_fpk/manifest` 里的 `version` 第三位 +1，否则 fnOS 安装会失败。详细打包注意事项见 [FPK_PACKAGING.md](./FPK_PACKAGING.md)。
+> ⚠️ `build_fpk.sh` 会直接使用 `build_fpk/manifest` 里的现有版本号。只有在你明确要发新版本时，才手动修改 `version`。详细打包注意事项见 [FPK_PACKAGING.md](./FPK_PACKAGING.md)。
 
 ## 目录结构
 
 ```
-fnrmux/
+rmux/
 ├── backend/       # Rust 后端（Axum + tmux 会话管理）
 ├── frontend/      # Vue 3 前端（xterm.js 终端 UI）
 ├── ui/            # 前端构建产物（vite build 输出）

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# FnRmux 公共函数库
+# Rmux 公共函数库
 # 包含安装、卸载、升级过程中使用的公共函数
 ################################################################################
 
@@ -70,23 +70,23 @@ volume_root ()
 
 stop_tmux_sessions ()
 {
-    install_log "停止所有 FnRmux 相关的终端进程..."
+    install_log "停止所有 Rmux 相关的终端进程..."
     
-    # 清理所有 FnRmux 启动的 tmux 进程 (根据我们的专用 socket 路径识别)
-    pkill -f "tmux.*-S /tmp/fnrmux_socks" 2>/dev/null || true
+    # 清理所有 Rmux 启动的 tmux 进程 (根据我们的专用 socket 路径识别)
+    pkill -f "tmux.*-S /tmp/rmux_socks" 2>/dev/null || true
     
     # 清理全局临时文件
-    rm -rf /tmp/fnrmux_socks 2>/dev/null
-    rm -rf /tmp/fnrmux_clipboard 2>/dev/null
-    rm -f /tmp/fnrmux_shell_wrapper.sh 2>/dev/null
-    rm -f /tmp/fnrmux_hit.log /tmp/fnrmux_debug.log /tmp/fnrmux_xclip.log 2>/dev/null
+    rm -rf /tmp/rmux_socks 2>/dev/null
+    rm -rf /tmp/rmux_clipboard 2>/dev/null
+    rm -f /tmp/rmux_shell_wrapper.sh 2>/dev/null
+    rm -f /tmp/rmux_hit.log /tmp/rmux_debug.log /tmp/rmux_xclip.log 2>/dev/null
     
     install_log "  服务进程与临时资源已清理"
 }
 
-stop_fnrmux_server ()
+stop_rmux_server ()
 {
-    install_log "停止 FnRmux 后端服务..."
+    install_log "停止 Rmux 后端服务..."
 
     local pid=""
     if [ -f "${PID_FILE}" ]; then
@@ -115,7 +115,7 @@ stop_fnrmux_server ()
 
 stop_runtime ()
 {
-    stop_fnrmux_server
+    stop_rmux_server
     stop_tmux_sessions
 }
 
@@ -128,9 +128,9 @@ clean_temp_files ()
 {
     install_log "清理运行时临时文件..."
     
-    rm -f "${TRIM_PKGVAR}/fnrmux.log"
-    rm -f "${TRIM_PKGVAR}/fnrmux.pid"
-    rm -f "${TRIM_PKGVAR}/fnrmux_jwt_secret_v2"
+    rm -f "${TRIM_PKGVAR}/rmux.log"
+    rm -f "${TRIM_PKGVAR}/rmux.pid"
+    rm -f "${TRIM_PKGVAR}/rmux_jwt_secret_v2"
     rm -rf "${TRIM_PKGVAR}/sessions"
     rm -rf "${TRIM_PKGVAR}/logs"
     rm -rf "${TRIM_PKGVAR}/outputs"
@@ -152,7 +152,7 @@ clean_all_data ()
         rm -rf "${TRIM_PKGVAR}"
     fi
 
-    # 2. 清理共享目录，避免文件管理器继续显示“应用文件/fnrmux”
+    # 2. 清理共享目录，避免文件管理器继续显示“应用文件/rmux”
     local volume=""
     if volume="$(volume_root)" && [ -n "${TRIM_APPNAME}" ] && [ -d "${volume}/@appshare/${TRIM_APPNAME}" ]; then
         install_log "  删除共享目录: ${volume}/@appshare/${TRIM_APPNAME}"
@@ -180,7 +180,7 @@ clean_all_data ()
     fi
 
     # 4. 清理公共临时资源
-    rm -rf /tmp/fnrmux*
+    rm -rf /tmp/rmux*
     
     install_log "所有数据已彻底清除，卸载完成"
 }

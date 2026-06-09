@@ -11,7 +11,7 @@
 
     <main class="settings-main">
       <header class="topbar">
-        <div class="brand">FnRmux <span class="sep">/</span> 设置</div>
+        <div class="brand">Rmux <span class="sep">/</span> 设置</div>
         <button class="btn-ghost back-btn" @click="router.push('/terminal')">
           <span class="icon">←</span> 返回终端
         </button>
@@ -107,8 +107,8 @@ const themeSettings = ref({ theme: 'onedark', fontSize: 14, cursorStyle: 'block'
 
 // 辅助函数
 const auth = () => ({
-  headers: sessionStorage.getItem('fnrmux_token')
-    ? { Authorization: 'Bearer ' + sessionStorage.getItem('fnrmux_token') }
+  headers: sessionStorage.getItem('rmux_token')
+    ? { Authorization: 'Bearer ' + sessionStorage.getItem('rmux_token') }
     : {}
 })
 

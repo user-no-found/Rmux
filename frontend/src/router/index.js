@@ -17,8 +17,8 @@ const router = createRouter({
 })
 
 router.beforeEach((to, from, next) => {
-  const hasToken = !!sessionStorage.getItem('fnrmux_token')
-  const hasUser = !!sessionStorage.getItem('fnrmux_auth_user')
+  const hasToken = !!sessionStorage.getItem('rmux_token')
+  const hasUser = !!sessionStorage.getItem('rmux_auth_user')
   if (to.meta.requiresAuth && !hasToken && !hasUser) {
     next('/login')
   } else {

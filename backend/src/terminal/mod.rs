@@ -64,7 +64,7 @@ pub async fn create_local_session(
     cols: u32,
     rows: u32,
 ) -> Result<TerminalSession, String> {
-    let tmux_name = format!("fnrmux_{}", session_id);
+    let tmux_name = format!("rmux_{}", session_id);
     let output_file = config.outputs_dir.join(format!("{}.out", session_id));
     let tmux_bin = config.tmux_path();
 
@@ -287,6 +287,7 @@ pub async fn write_to_tmux(
         "send-keys",
         "-t",
         session_name,
+        "-l",
         data,
     ]);
     let result = cmd.output().await;
@@ -294,6 +295,82 @@ pub async fn write_to_tmux(
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
         Err(e) => Err(format!("tmux error: {}", e)),
+    }
+}
+
+pub async fn paste_to_tmux(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+    data: &str,
+) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
+    tokio::fs::create_dir_all(&config.clipboard_dir)
+        .await
+        .map_err(|e| format!("创建粘贴临时目录失败: {}", e))?;
+
+    let buffer_name = format!("rmux_paste_{}", uuid::Uuid::new_v4().simple());
+    let paste_file = config.clipboard_dir.join(format!("{}.txt", buffer_name));
+    tokio::fs::write(&paste_file, data)
+        .await
+        .map_err(|e| format!("写入粘贴临时文件失败: {}", e))?;
+
+    let paste_file_str = paste_file.display().to_string();
+    let socket_str = socket.display().to_string();
+
+    let mut load_cmd = tokio::process::Command::new(config.tmux_path());
+    if let Some(lib) = config.tmux_lib_dir() {
+        load_cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    load_cmd.args([
+        "-u",
+        "-S",
+        &socket_str,
+        "load-buffer",
+        "-b",
+        &buffer_name,
+        &paste_file_str,
+    ]);
+
+    let load_output = load_cmd
+        .output()
+        .await
+        .map_err(|e| format!("tmux load-buffer 执行失败: {}", e))?;
+    let _ = tokio::fs::remove_file(&paste_file).await;
+
+    if !load_output.status.success() {
+        return Err(String::from_utf8_lossy(&load_output.stderr).to_string());
+    }
+
+    let mut paste_cmd = tokio::process::Command::new(config.tmux_path());
+    if let Some(lib) = config.tmux_lib_dir() {
+        paste_cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    paste_cmd.args([
+        "-u",
+        "-S",
+        &socket_str,
+        "paste-buffer",
+        "-d",
+        "-p",
+        "-b",
+        &buffer_name,
+        "-t",
+        session_name,
+    ]);
+
+    let paste_output = paste_cmd
+        .output()
+        .await
+        .map_err(|e| format!("tmux paste-buffer 执行失败: {}", e))?;
+    if paste_output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&paste_output.stderr).to_string())
     }
 }
 
@@ -364,6 +441,19 @@ pub async fn capture_tmux_history(
     session_name: &str,
     lines: u32,
 ) -> Result<String, String> {
+    match capture_tmux_history_inner(config, session_id, session_name, lines, true).await {
+        Ok(history) => Ok(history),
+        Err(_) => capture_tmux_history_inner(config, session_id, session_name, lines, false).await,
+    }
+}
+
+async fn capture_tmux_history_inner(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+    lines: u32,
+    alternate_screen: bool,
+) -> Result<String, String> {
     let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
     let mut cmd = tokio::process::Command::new(config.tmux_path());
     if let Some(lib) = config.tmux_lib_dir() {
@@ -375,12 +465,11 @@ pub async fn capture_tmux_history(
         &socket.display().to_string(),
         "capture-pane",
         "-e", // 包含转义序列（颜色等）
-        "-t",
-        session_name,
-        "-S",
-        &format!("-{}", lines),
-        "-p",
     ]);
+    if alternate_screen {
+        cmd.arg("-a");
+    }
+    cmd.args(["-t", session_name, "-S", &format!("-{}", lines), "-p"]);
     let result = cmd.output().await;
     match result {
         Ok(output) if output.status.success() => {
@@ -410,7 +499,11 @@ fn compact_captured_history(history: &str) -> String {
         out.push(line);
     }
 
-    while out.last().map(|line| line.trim().is_empty()).unwrap_or(false) {
+    while out
+        .last()
+        .map(|line| line.trim().is_empty())
+        .unwrap_or(false)
+    {
         out.pop();
     }
 

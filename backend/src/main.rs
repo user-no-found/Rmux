@@ -80,7 +80,7 @@ async fn main() {
         ))
         .service(ServeDir::new(&config.ui_dir).fallback(ServeFile::new(index_file)));
 
-    // fnOS 桌面/应用商店从 /app/fnrmux/images/ 读取图标，而图标实际位于
+    // fnOS 桌面/应用商店从 /app/rmux/images/ 读取图标，而图标实际位于
     // app/ui/images/（与 app/www/ 同级），不会被 ui_dir 的 SPA fallback 命中。
     // 单独把它 serve 出来，否则 fnOS 拿到的是 index.html，前端会显示首字母占位图。
     let images_dir = config
@@ -100,14 +100,14 @@ async fn main() {
                 .allow_headers(Any),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .nest_service("/app/fnrmux/images", images_service.clone())
+        .nest_service("/app/rmux/images", images_service.clone())
         .nest_service("/images", images_service)
-        .nest_service("/app/fnrmux", static_files.clone())
+        .nest_service("/app/rmux", static_files.clone())
         .fallback_service(static_files);
 
     // Start server
     let addr = format!("{}:{}", config.host, config.port);
-    tracing::info!("FnRmux 服务启动: http://{}", addr);
+    tracing::info!("Rmux 服务启动: http://{}", addr);
     tracing::info!("📁 数据目录: {}", config.data_dir.display());
     tracing::info!("🗄️  数据库: {}", config.db_path.display());
 

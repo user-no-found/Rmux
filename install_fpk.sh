@@ -1,14 +1,14 @@
 #!/bin/bash
-# FnRmux FPK 手动安装脚本
+# Rmux FPK 手动安装脚本
 # 用于 appcenter-cli 不可用时
 
 set -e
 FPK="$1"
-APPDIR="/var/apps/fnrmux"
-CENTERDIR="/usr/local/apps/@appcenter/fnrmux"
+APPDIR="/var/apps/rmux"
+CENTERDIR="/usr/local/apps/@appcenter/rmux"
 
 if [ -z "$FPK" ]; then
-    echo "Usage: $0 <fnrmux.fpk>"
+    echo "Usage: $0 <rmux.fpk>"
     exit 1
 fi
 
@@ -69,11 +69,11 @@ if [ -d "$APPDIR/target" ]; then
 fi
 
 # Create socket
-touch "$CENTERDIR/fnrmux.sock"
-chmod 666 "$CENTERDIR/fnrmux.sock"
+touch "$CENTERDIR/rmux.sock"
+chmod 666 "$CENTERDIR/rmux.sock"
 
 echo ""
-echo "✅ FnRmux 安装完成!"
+echo "✅ Rmux 安装完成!"
 echo "   应用目录: $APPDIR"
 echo "   中心目录: $CENTERDIR"
 echo ""

@@ -1,12 +1,12 @@
-appname               = fnrmux
-version               = 0.0.1
-display_name          = FnRmux
+appname               = rmux
+version               = 0.0.2
+display_name          = Rmux
 desc                  = Web 终端管理，会话持久化，主题自定义
 platform              = x86
 source                = thirdparty
 maintainer            = user-no-found
 distributor           = user-no-found
 desktop_uidir         = ui
-desktop_applaunchname = fnrmux.Application
+desktop_applaunchname = rmux.Application
 service_port          = 18732
 checkport             = false
