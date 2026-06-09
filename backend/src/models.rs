@@ -98,10 +98,7 @@ pub struct ClipboardItem {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "contentType"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "contentType")]
     pub content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<i64>,
@@ -206,6 +203,8 @@ impl IntoResponse for ApiError {
 pub enum TerminalMessage {
     #[serde(rename = "input")]
     Input { data: String },
+    #[serde(rename = "paste")]
+    Paste { data: String },
     #[serde(rename = "resize")]
     Resize { cols: u32, rows: u32 },
     #[serde(rename = "resume_session")]

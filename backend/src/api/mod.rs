@@ -394,23 +394,43 @@ async fn handle_terminal_resume(
     let tmux_name_clone = tmux_name.clone();
     let mut history_sent = false;
 
-    tokio::spawn(async move {
+    let output_task = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-        let mut file = match tokio::fs::File::open(&output_file_clone).await {
+        const MAX_OUTPUT_DELTA_BYTES: u64 = 256 * 1024;
+
+        let mut file = match tokio::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&output_file_clone)
+            .await
+        {
             Ok(f) => f,
-            Err(_) => return,
+            Err(e) => {
+                warn!("打开输出文件失败: {}", e);
+                return;
+            }
         };
         let mut last_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         let (tx_notify, mut rx_notify) = tokio::sync::mpsc::channel(1);
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, notify::EventKind::Modify(_)) {
-                    let _ = tx_notify.try_send(());
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, notify::EventKind::Modify(_)) {
+                        let _ = tx_notify.try_send(());
+                    }
                 }
-            }
-        })
-        .unwrap();
-        let _ = watcher.watch(&output_file_clone, RecursiveMode::NonRecursive);
+            }) {
+                Ok(watcher) => watcher,
+                Err(e) => {
+                    warn!("创建输出监听失败: {}", e);
+                    return;
+                }
+            };
+        if let Err(e) = watcher.watch(&output_file_clone, RecursiveMode::NonRecursive) {
+            warn!("监听输出文件失败: {}", e);
+            return;
+        }
         loop {
             // 等待变更通知
             if rx_notify.recv().await.is_none() {
@@ -427,13 +447,21 @@ async fn handle_terminal_resume(
 
             if let Ok(meta) = file.metadata().await {
                 let len = meta.len();
-                if len > last_size {
-                    let mut buffer = vec![0; (len - last_size) as usize];
+                if len < last_size {
+                    last_size = 0;
+                    let _ = file.seek(SeekFrom::Start(0)).await;
+                }
+
+                while len > last_size {
+                    let read_len = std::cmp::min(len - last_size, MAX_OUTPUT_DELTA_BYTES);
+                    let mut buffer = vec![0; read_len as usize];
                     let _ = file.seek(SeekFrom::Start(last_size)).await;
                     if file.read_exact(&mut buffer).await.is_ok() {
                         let delta = String::from_utf8_lossy(&buffer).to_string();
                         let _ = tx_clone.send(delta);
-                        last_size = len;
+                        last_size += read_len;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -450,13 +478,14 @@ async fn handle_terminal_resume(
                                 TerminalMessage::Input { data } => {
                                     let _ = terminal::write_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
                                 }
+                                TerminalMessage::Paste { data } => {
+                                    let _ = terminal::paste_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
+                                }
                                 TerminalMessage::Resize { cols, rows } => {
                                     let _ = terminal::resize_tmux(&state.config, &session_id_param, &tmux_name, cols, rows).await;
                                     if !history_sent {
-                                        if !is_new {
-                                            if let Ok(history) = terminal::capture_tmux_history(&config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
-                                                let _ = ws.send(Message::Text(format!("\x1b[2J\x1b[H{}", history).into())).await;
-                                            }
+                                        if let Ok(history) = terminal::capture_tmux_history(&config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
+                                            let _ = ws.send(Message::Text(format!("\x1b[2J\x1b[H{}", history).into())).await;
                                         }
                                         history_sent = true;
                                     }
@@ -478,6 +507,8 @@ async fn handle_terminal_resume(
             }
         }
     }
+
+    output_task.abort();
 }
 
 // ─── Clipboard & Theme & System Handlers ────────────────────────────────
@@ -578,9 +609,10 @@ fn prune_clipboard_history(
             )
             .map_err(|e| ApiError::new(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![owner_uid, CLIPBOARD_HISTORY_LIMIT], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                rusqlite::params![owner_uid, CLIPBOARD_HISTORY_LIMIT],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|e| ApiError::new(e.to_string()))?;
         rows.filter_map(Result::ok).collect::<Vec<_>>()
     };
@@ -614,17 +646,20 @@ async fn list_clipboard(
         )
         .map_err(|e| ApiError::new(e.to_string()))?;
     let rows = stmt
-        .query_map(rusqlite::params![auth.0.uid, CLIPBOARD_HISTORY_LIMIT], |row| {
-            Ok(ClipboardItem {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                text: row.get(2)?,
-                path: row.get(3)?,
-                content_type: row.get(4)?,
-                size: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        })
+        .query_map(
+            rusqlite::params![auth.0.uid, CLIPBOARD_HISTORY_LIMIT],
+            |row| {
+                Ok(ClipboardItem {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    text: row.get(2)?,
+                    path: row.get(3)?,
+                    content_type: row.get(4)?,
+                    size: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
         .map_err(|e| ApiError::new(e.to_string()))?;
 
     let mut items: Vec<ClipboardItem> = Vec::new();

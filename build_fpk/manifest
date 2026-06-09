@@ -1,5 +1,5 @@
 appname               = fnrmux
-version               = 0.0.1
+version               = 0.0.2
 display_name          = FnRmux
 desc                  = Web 终端管理，会话持久化，主题自定义
 platform              = x86
