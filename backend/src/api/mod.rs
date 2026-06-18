@@ -373,17 +373,30 @@ async fn handle_terminal_resume(
     state: AppState,
     mut ws: WebSocket,
     session_id_param: String,
-    _auth: AuthUserExtractor,
+    auth: AuthUserExtractor,
 ) {
-    let (tmux_name, output_file, is_new) = {
+    let session = {
         let sessions = state.sessions.read().await;
-        if let Some(s) = sessions.get(&session_id_param) {
-            (s.tmux_session_name.clone(), s.output_file.clone(), s.is_new)
-        } else {
-            let _ = ws.send(Message::Text("SESSION_NOT_FOUND".into())).await;
-            return;
-        }
+        sessions.get(&session_id_param).cloned()
     };
+    let session = if let Some(session) = session {
+        session
+    } else if let Some(session) =
+        recover_tmux_session(&state.config, &session_id_param, &auth.0).await
+    {
+        let mut sessions = state.sessions.write().await;
+        sessions
+            .entry(session_id_param.clone())
+            .or_insert_with(|| session.clone());
+        session
+    } else {
+        let _ = ws.send(Message::Text("SESSION_NOT_FOUND".into())).await;
+        return;
+    };
+
+    let tmux_name = session.tmux_session_name.clone();
+    let output_file = session.output_file.clone();
+    let is_new = session.is_new;
 
     if is_new {
         let mut sessions = state.sessions.write().await;
@@ -460,8 +473,9 @@ async fn handle_terminal_resume(
                                 TerminalMessage::Input { data } => {
                                     let _ = terminal::write_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
                                     if let Some(delay_ms) = input_snapshot_delay_ms(&data) {
+                                        let submitted = is_submit_input(&data);
                                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone).await {
+                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone, submitted).await {
                                             if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
                                                 break;
                                             }
@@ -472,8 +486,9 @@ async fn handle_terminal_resume(
                                 TerminalMessage::Paste { data } => {
                                     let _ = terminal::paste_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
                                     if let Some(delay_ms) = input_snapshot_delay_ms(&data) {
+                                        let submitted = is_submit_input(&data);
                                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone).await {
+                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone, submitted).await {
                                             if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
                                                 break;
                                             }
@@ -504,14 +519,53 @@ async fn handle_terminal_resume(
     }
 }
 
+async fn recover_tmux_session(
+    config: &AppConfig,
+    session_id: &str,
+    auth: &AuthUser,
+) -> Option<TerminalSession> {
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+
+    let tmux_name = format!("rmux_{}", session_id);
+    if !terminal::check_tmux_session(config, session_id, &tmux_name).await {
+        return None;
+    }
+
+    let cwd = terminal::query_tmux_cwd(config, session_id, &tmux_name, "/").await;
+    let now = chrono::Utc::now().to_rfc3339();
+    Some(TerminalSession {
+        session_id: session_id.to_string(),
+        name: "本地终端".into(),
+        owner_uid: auth.uid,
+        owner_user: auth.user.clone(),
+        session_type: "local".into(),
+        created_at: now.clone(),
+        last_activity: now,
+        size: TermSize { cols: 80, rows: 24 },
+        is_new: false,
+        tmux_session_name: tmux_name,
+        output_file: config.outputs_dir.join(format!("{}.out", session_id)),
+        cwd,
+    })
+}
+
 fn input_snapshot_delay_ms(data: &str) -> Option<u64> {
     if data.is_empty() {
         None
-    } else if data.contains('\n') || data.contains('\r') {
+    } else if is_submit_input(data) {
         Some(ENTER_SNAPSHOT_DELAY_MS)
     } else {
         Some(INPUT_SNAPSHOT_DELAY_MS)
     }
+}
+
+fn is_submit_input(data: &str) -> bool {
+    data.contains('\n') || data.contains('\r')
 }
 
 async fn skip_captured_output(

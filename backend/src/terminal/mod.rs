@@ -30,6 +30,23 @@ fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+fn shell_terminal_env_prefix() -> &'static str {
+    "unset NO_COLOR; export TERM=xterm-256color; export COLORTERM=truecolor; export TERM_PROGRAM=Rmux; export CLICOLOR=1"
+}
+
+fn apply_tmux_parent_env(cmd: &mut tokio::process::Command) {
+    cmd.env_remove("NO_COLOR");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "Rmux");
+    cmd.env("CLICOLOR", "1");
+}
+
+fn apply_terminal_env(cmd: &mut tokio::process::Command, shell: &str) {
+    apply_tmux_parent_env(cmd);
+    cmd.env("SHELL", shell);
+}
+
 pub async fn query_tmux_cwd(
     config: &AppConfig,
     session_id: &str,
@@ -117,12 +134,13 @@ pub async fn create_local_session(
 
     // 构造内部 tmux 命令
     let mut tmux_cmd_str = tmux_bin.display().to_string();
+    let terminal_env_prefix = shell_terminal_env_prefix();
     if let Some(lib) = config.tmux_lib_dir() {
-        tmux_cmd_str = format!("export LD_LIBRARY_PATH={}:${{LD_LIBRARY_PATH:-}}; export LANG=C.UTF-8; export LC_ALL=C.UTF-8; {}", lib.display(), tmux_cmd_str);
+        tmux_cmd_str = format!("export LD_LIBRARY_PATH={}:${{LD_LIBRARY_PATH:-}}; export LANG=C.UTF-8; export LC_ALL=C.UTF-8; {}; {}", lib.display(), terminal_env_prefix, tmux_cmd_str);
     } else {
         tmux_cmd_str = format!(
-            "export LANG=C.UTF-8; export LC_ALL=C.UTF-8; {}",
-            tmux_cmd_str
+            "export LANG=C.UTF-8; export LC_ALL=C.UTF-8; {}; {}",
+            terminal_env_prefix, tmux_cmd_str
         );
     }
 
@@ -182,7 +200,7 @@ pub async fn create_local_session(
     if let Some(lib) = config.tmux_lib_dir() {
         cmd.env("LD_LIBRARY_PATH", lib);
     }
-    cmd.env("SHELL", shell);
+    apply_terminal_env(&mut cmd, shell);
 
     let result = cmd.output().await;
 
@@ -199,17 +217,23 @@ pub async fn create_local_session(
                 return Err("终端创建失败，请检查系统账户权限".into());
             }
 
+            configure_tmux_terminal(config, session_id).await;
+
             // 启用输出捕获
             let mut pipe_cmd;
             let mut pipe_tmux_str = tmux_bin.display().to_string();
             if let Some(lib) = config.tmux_lib_dir() {
                 pipe_tmux_str = format!(
-                    "export LD_LIBRARY_PATH={}:${{LD_LIBRARY_PATH:-}}; export LANG=C.UTF-8; {}",
+                    "export LD_LIBRARY_PATH={}:${{LD_LIBRARY_PATH:-}}; export LANG=C.UTF-8; {}; {}",
                     lib.display(),
+                    terminal_env_prefix,
                     pipe_tmux_str
                 );
             } else {
-                pipe_tmux_str = format!("export LANG=C.UTF-8; {}", pipe_tmux_str);
+                pipe_tmux_str = format!(
+                    "export LANG=C.UTF-8; {}; {}",
+                    terminal_env_prefix, pipe_tmux_str
+                );
             }
 
             let pipe_args = format!(
@@ -239,6 +263,7 @@ pub async fn create_local_session(
                 pipe_cmd = tokio::process::Command::new(su_bin);
                 pipe_cmd.args(["-", &_login_user.user, "-c", &pipe_args]);
             }
+            apply_tmux_parent_env(&mut pipe_cmd);
             match pipe_cmd.output().await {
                 Ok(pipe_output) if pipe_output.status.success() => {
                     info!("📝 已启用 pipe-pane 输出捕获: {}", output_file_for_pipe.display());
@@ -292,6 +317,55 @@ pub async fn create_local_session(
                 e
             );
             Err(format!("tmux 命令执行失败: {}", e))
+        }
+    }
+}
+
+async fn run_tmux_control_command(
+    config: &AppConfig,
+    session_id: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
+    let socket_str = socket.display().to_string();
+    let mut cmd = tokio::process::Command::new(config.tmux_path());
+    if let Some(lib) = config.tmux_lib_dir() {
+        cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    apply_tmux_parent_env(&mut cmd);
+    cmd.args(["-u", "-S", &socket_str]);
+    cmd.args(args);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("tmux control error: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+async fn configure_tmux_terminal(config: &AppConfig, session_id: &str) {
+    let commands = [
+        vec!["set-option", "-g", "default-terminal", "tmux-256color"],
+        vec![
+            "set-option",
+            "-a",
+            "-s",
+            "terminal-features",
+            ",xterm-256color:RGB,tmux-256color:RGB,screen-256color:RGB",
+        ],
+        vec!["set-environment", "-g", "-u", "NO_COLOR"],
+        vec!["set-environment", "-g", "COLORTERM", "truecolor"],
+        vec!["set-environment", "-g", "TERM_PROGRAM", "Rmux"],
+        vec!["set-environment", "-g", "CLICOLOR", "1"],
+    ];
+
+    for args in commands {
+        if let Err(e) = run_tmux_control_command(config, session_id, &args).await {
+            error!("配置 tmux 终端能力失败 ({:?}): {}", args, e);
         }
     }
 }
@@ -491,9 +565,16 @@ pub async fn should_snapshot_after_input(
     config: &AppConfig,
     session_id: &str,
     session_name: &str,
+    submitted: bool,
 ) -> bool {
     match query_tmux_pane_state(config, session_id, session_name).await {
-        Ok(state) => state.is_shell() && !state.alternate_on && state.pane_modes == 0,
+        Ok(state) => {
+            if state.alternate_on || state.pane_modes != 0 {
+                return false;
+            }
+
+            state.is_shell() || (submitted && state.should_snapshot_after_submit())
+        }
         Err(_) => true,
     }
 }
@@ -545,6 +626,10 @@ impl TmuxPaneState {
             self.current_command.as_str(),
             "sh" | "bash" | "zsh" | "fish" | "dash" | "ash" | "ksh" | "mksh" | "csh" | "tcsh" | "nu"
         )
+    }
+
+    fn should_snapshot_after_submit(&self) -> bool {
+        matches!(self.current_command.as_str(), "claude")
     }
 }
 
