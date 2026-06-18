@@ -2,7 +2,6 @@ import { createRouter, createWebHistory } from 'vue-router'
 import LoginView from '../views/LoginView.vue'
 import TerminalView from '../views/TerminalView.vue'
 import ConfigView from '../views/ConfigView.vue'
-import { APP_BASE } from '../runtimeBase'
 
 const routes = [
   { path: '/', redirect: '/login' },
@@ -12,7 +11,7 @@ const routes = [
 ]
 
 const router = createRouter({
-  history: createWebHistory(APP_BASE),
+  history: createWebHistory(),
   routes,
 })
 

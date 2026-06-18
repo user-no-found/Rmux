@@ -135,6 +135,11 @@ const fitAddons = reactive({})
 const wsConnections = reactive({})
 const pendingTermWrites = {}
 const writeFrameIds = {}
+const writeFlushTimerIds = {}
+const reconnectTimers = {}
+const reconnectAttempts = {}
+const closingSessions = new Set()
+const wsVersions = {}
 const toastMsg = ref('')
 const systemInfo = ref({ hostname: 'localhost', os: 'Linux', arch: 'x86_64' })
 const repoHref = 'https://github.com/user-no-found/Rmux'
@@ -149,6 +154,7 @@ const CLIPBOARD_HISTORY_LIMIT = 20
 const MAX_TEXT_HISTORY_CHARS = 100000
 const MAX_TERMINAL_WRITE_CHARS = 128 * 1024
 const SESSION_REFRESH_MS = 15000
+const MAX_RECONNECT_DELAY_MS = 5000
 const COMBINING_CODEPOINT_RANGES = [
   [0x0300, 0x036f], [0x0483, 0x0489], [0x0591, 0x05bd], [0x05bf, 0x05bf],
   [0x05c1, 0x05c2], [0x05c4, 0x05c5], [0x05c7, 0x05c7], [0x0610, 0x061a],
@@ -302,12 +308,44 @@ const setRenameInputRef = (id, el) => {
   if (el) renameInputRefs[id] = el
 }
 
+const wsIsCurrent = (id, ws) => wsConnections[id] === ws
+
+const sendResizeForSession = (id) => {
+  const ws = wsConnections[id]
+  const term = termInstances[id]
+  const fitAddon = fitAddons[id]
+  if (!ws || ws.readyState !== WebSocket.OPEN || !term) return false
+
+  if (fitAddon) fitTerminal(id)
+  ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+  return true
+}
+
+const clearReconnectTimer = (id) => {
+  if (reconnectTimers[id]) {
+    clearTimeout(reconnectTimers[id])
+    delete reconnectTimers[id]
+  }
+}
+
+const scheduleReconnect = (id) => {
+  if (closingSessions.has(id) || reconnectTimers[id] || !termInstances[id]) return
+
+  const attempts = reconnectAttempts[id] || 0
+  const delay = Math.min(400 * Math.max(1, attempts), MAX_RECONNECT_DELAY_MS)
+  reconnectTimers[id] = setTimeout(() => {
+    delete reconnectTimers[id]
+    connectTerminalSocket(id)
+  }, delay)
+}
+
 const sendTerminalMessage = (type, data, sessionId = activeSession.value) => {
   const ws = wsConnections[sessionId]
   if (data && ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type, data }))
     return true
   }
+  if (data && sessionId) scheduleReconnect(sessionId)
   return false
 }
 
@@ -621,24 +659,35 @@ const loadSystemInfo = async () => {
   } catch (e) {}
 }
 
-const scheduleTerminalFlush = (id) => {
-  if (!termInstances[id] || writeFrameIds[id]) return
-
-  writeFrameIds[id] = requestAnimationFrame(() => {
+const flushTerminalWrites = (id) => {
+  if (writeFrameIds[id]) {
+    cancelAnimationFrame(writeFrameIds[id])
     delete writeFrameIds[id]
-    const term = termInstances[id]
-    const pending = pendingTermWrites[id] || ''
-    if (!term || !pending) {
-      pendingTermWrites[id] = ''
-      return
-    }
+  }
+  if (writeFlushTimerIds[id]) {
+    clearTimeout(writeFlushTimerIds[id])
+    delete writeFlushTimerIds[id]
+  }
 
-    const chunk = pending.slice(0, MAX_TERMINAL_WRITE_CHARS)
-    pendingTermWrites[id] = pending.slice(chunk.length)
-    term.write(chunk, () => {
-      if (pendingTermWrites[id] && termInstances[id]) scheduleTerminalFlush(id)
-    })
+  const term = termInstances[id]
+  const pending = pendingTermWrites[id] || ''
+  if (!term || !pending) {
+    pendingTermWrites[id] = ''
+    return
+  }
+
+  const chunk = pending.slice(0, MAX_TERMINAL_WRITE_CHARS)
+  pendingTermWrites[id] = pending.slice(chunk.length)
+  term.write(chunk, () => {
+    if (pendingTermWrites[id] && termInstances[id]) scheduleTerminalFlush(id)
   })
+}
+
+const scheduleTerminalFlush = (id) => {
+  if (!termInstances[id] || writeFrameIds[id] || writeFlushTimerIds[id]) return
+
+  writeFrameIds[id] = requestAnimationFrame(() => flushTerminalWrites(id))
+  writeFlushTimerIds[id] = setTimeout(() => flushTerminalWrites(id), 50)
 }
 
 const writeTerminalData = (id, data) => {
@@ -660,6 +709,58 @@ const loadSessions = async () => {
       }
     }
   } catch (e) {}
+}
+
+const connectTerminalSocket = (id) => {
+  const term = termInstances[id]
+  if (!term || closingSessions.has(id)) return
+
+  const current = wsConnections[id]
+  if (current?.readyState === WebSocket.OPEN || current?.readyState === WebSocket.CONNECTING) {
+    return
+  }
+
+  clearReconnectTimer(id)
+  const token = sessionStorage.getItem('rmux_token') || ''
+  const ws = new WebSocket(`${WS_BASE}/ws/terminal/${id}?token=${encodeURIComponent(token)}`)
+  wsConnections[id] = ws
+  wsVersions[id] = (wsVersions[id] || 0) + 1
+  const version = wsVersions[id]
+
+  ws.onopen = () => {
+    if (!wsIsCurrent(id, ws) || wsVersions[id] !== version) return
+    reconnectAttempts[id] = 0
+    setTimeout(() => {
+      if (!wsIsCurrent(id, ws) || wsVersions[id] !== version) return
+      sendResizeForSession(id)
+      if (activeSession.value === id) term.focus()
+    }, 80)
+  }
+
+  ws.onmessage = (e) => {
+    if (!wsIsCurrent(id, ws) || wsVersions[id] !== version) return
+    if (e.data === 'SESSION_NOT_FOUND' || e.data === 'SESSION_GONE') {
+      term.write('\r\n\x1b[31m[会话已结束]\x1b[0m')
+      return
+    }
+    writeTerminalData(id, e.data)
+  }
+
+  ws.onclose = () => {
+    if (!wsIsCurrent(id, ws) || wsVersions[id] !== version) return
+    delete wsConnections[id]
+    if (closingSessions.has(id)) {
+      closingSessions.delete(id)
+      return
+    }
+    if (!termInstances[id]) return
+    reconnectAttempts[id] = (reconnectAttempts[id] || 0) + 1
+    scheduleReconnect(id)
+  }
+
+  ws.onerror = () => {
+    if (wsIsCurrent(id, ws)) ws.close()
+  }
 }
 
 const initTerminal = async (id) => {
@@ -711,34 +812,7 @@ const initTerminal = async (id) => {
   termInstances[id] = term
   fitAddons[id] = fitAddon
 
-  const token = sessionStorage.getItem('rmux_token') || ''
-  const ws = new WebSocket(`${WS_BASE}/ws/terminal/${id}?token=${encodeURIComponent(token)}`)
-  wsConnections[id] = ws
-
-  ws.onopen = () => {
-    setTimeout(() => {
-      if (fitAddons[id]) {
-        fitTerminal(id)
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
-        }
-      }
-      term.focus()
-    }, 80)
-  }
-
-  ws.onmessage = (e) => {
-    if (e.data === 'SESSION_NOT_FOUND' || e.data === 'SESSION_GONE') {
-      term.write('\r\n\x1b[31m[会话已结束]\x1b[0m')
-      return
-    }
-    writeTerminalData(id, e.data)
-  }
-  ws.onclose = () => {
-    if (termInstances[id]) {
-      term.write('\r\n\x1b[31m[连接已断开]\x1b[0m')
-    }
-  }
+  connectTerminalSocket(id)
 
   term.onData((data) => {
     if (data === '\x16' && Date.now() < suppressCtrlVInputUntil) {
@@ -751,7 +825,8 @@ const initTerminal = async (id) => {
   term.onResize(({ cols, rows }) => {
     clearTimeout(resizeTimer)
     resizeTimer = setTimeout(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }))
+      const ws = wsConnections[id]
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }))
     }, 220)
   })
 
@@ -772,7 +847,7 @@ const initTerminal = async (id) => {
       return false
     }
     if (e.type === 'keydown' && e.ctrlKey && e.key === 'Enter') {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data: '\n' }))
+      sendTerminalMessage('input', '\n', id)
       return false
     }
     return true
@@ -828,6 +903,8 @@ const createNewSession = async () => {
 }
 
 const closeSession = async (id) => {
+  closingSessions.add(id)
+  clearReconnectTimer(id)
   try {
     await axios.delete(`${API_BASE}/api/sessions/${id}`, authHeaders())
   } catch (e) {}
@@ -835,6 +912,8 @@ const closeSession = async (id) => {
     wsConnections[id].close()
     delete wsConnections[id]
   }
+  delete reconnectAttempts[id]
+  delete wsVersions[id]
   if (termInstances[id]) {
     termInstances[id].dispose()
     delete termInstances[id]
@@ -843,6 +922,10 @@ const closeSession = async (id) => {
   if (writeFrameIds[id]) {
     cancelAnimationFrame(writeFrameIds[id])
     delete writeFrameIds[id]
+  }
+  if (writeFlushTimerIds[id]) {
+    clearTimeout(writeFlushTimerIds[id])
+    delete writeFlushTimerIds[id]
   }
   delete pendingTermWrites[id]
   sessions.value = sessions.value.filter(s => s.session_id !== id)
@@ -1012,7 +1095,10 @@ onBeforeUnmount(() => {
   window.removeEventListener('paste', handlePaste, true)
   clearPendingShortcutPaste()
   clearInterval(sessionRefreshTimer)
+  Object.keys(termInstances).forEach(id => closingSessions.add(id))
   Object.values(writeFrameIds).forEach(id => cancelAnimationFrame(id))
+  Object.values(writeFlushTimerIds).forEach(id => clearTimeout(id))
+  Object.values(reconnectTimers).forEach(id => clearTimeout(id))
   Object.values(wsConnections).forEach(ws => ws.close())
   Object.values(termInstances).forEach(t => t.dispose())
 })

@@ -150,7 +150,7 @@ fn fallback_real_user() -> Option<(String, i64)> {
         .unwrap_or_else(|| format!("uid-{}", uid));
 
     if !user.is_empty() {
-        warn!("系统头缺失，使用当前进程身份: {}", user);
+        warn!("使用当前进程身份: {}", user);
         return Some((user, uid));
     }
 
@@ -167,28 +167,8 @@ pub fn home_for_user(username: &str) -> Option<String> {
     })
 }
 
-/// 智能身份探测：优先 headers，其次使用当前进程身份兜底
-pub fn detect_real_user(parts: &Parts) -> Option<(String, i64)> {
-    // 1. 优先尝试从 fnOS 系统头获取身份 (系统级自动登录)
-    let sys_user = parts
-        .headers
-        .get("x-fn-username")
-        .or_else(|| parts.headers.get("x-fn-user"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    if let Some(user) = sys_user {
-        let uid = parts
-            .headers
-            .get("x-fn-uid")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .or_else(|| user_from_name(&user).map(|local_user| local_user.uid))
-            .unwrap_or(1000);
-        return Some((user, uid));
-    }
-
-    // 2. 兜底逻辑：本地直连或 fnOS 未透传系统头时，锁定真实可登录用户。
+/// 智能身份探测：使用当前进程身份兜底
+pub fn detect_real_user(_parts: &Parts) -> Option<(String, i64)> {
     fallback_real_user()
 }
 
@@ -223,7 +203,7 @@ where
         async move {
             let config = config.ok_or(AuthError("Server config not found".into()))?;
 
-            // 1. 系统级自动登录 (带智能探测)
+            // 1. 系统级自动登录 (基于本地用户探测)
             if let Some((user, uid)) = detected {
                 let has_password = std::fs::metadata(&config.auth_file).is_ok();
                 let has_skip_marker = std::fs::metadata(&config.skip_auth_file).is_ok();

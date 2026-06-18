@@ -6,17 +6,11 @@ backend/target/
 frontend/dist/
 ui/assets/
 ui/index.html
-build_fpk/app/www/
-build_fpk/app/server/fnrmux
-build_fpk/app.tgz
-build_fpk/fnrmux.fpk
-
-# Generated cache-busted package icons
-build_fpk/app/ui/images/*_v*.png
 
 # Runtime/local files
 .env
 .env.*
+var/
 *.log
 *.pid
 

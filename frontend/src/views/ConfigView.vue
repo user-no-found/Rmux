@@ -96,10 +96,10 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import axios from 'axios'
-import { API_BASE, assetUrl } from '../runtimeBase'
+import { API_BASE } from '../runtimeBase'
 
 const router = useRouter()
-const iconUrl = assetUrl('icon.png')
+const iconUrl = '/icon.png'
 
 // 状态
 const tab = ref('theme')

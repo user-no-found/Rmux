@@ -1,25 +1,25 @@
-# Rmux · 飞牛 fnOS Web 终端
+# Rmux · Web Terminal
 
-为飞牛 fnOS 打造的浏览器终端应用，解决「在 NAS 上用 Web 终端跑 CLI 工具」时的两个体验问题。
+Rmux 是一个面向本地 Linux/Ubuntu 环境的浏览器终端应用，用来在 Web 页面里运行常用 CLI 工具，并保留接近桌面终端的输入体验。
 
 ## 为什么做这个？
 
-平时在 NAS 上用 Web 终端，自己遇到过两个一直没能很顺手解决的小问题：
+平时在 Web 终端里使用 Claude Code、Codex 等 CLI 工具时，常见的两个操作不够顺手：
 
-- **`Ctrl + Enter` 无法换行**：在 Claude Code、Codex 等 CLI 工具里需要多行输入时，希望 `Ctrl + Enter` 能插入换行而不是直接提交。
-- **图片无法传入终端**：在用 AI / CLI 工具时，经常想把一张截图作为输入交给终端里的程序，但 Web 终端本身没有「把图片送进终端」的通道。
+- **`Ctrl + Enter` 无法换行**：多行输入时，希望 `Ctrl + Enter` 插入换行，而不是直接提交。
+- **图片无法传入终端**：需要把截图交给终端里的程序时，希望复制图片后能直接粘贴，并自动得到后端保存后的文件路径。
 
-这两个点恰好都是我日常用得最多的场景，于是顺手写了这个项目，把这两件事处理掉。
+Rmux 把这些终端交互补上，同时用 tmux 保持会话状态，浏览器刷新或重新连接后仍能回到原来的终端。
 
 ## 它能做什么
 
 - ✅ **`Ctrl + Enter` 正确发送 LF**：在 CLI 工具里正常换行，不会误触提交
-- ✅ **图片可以直接传入终端**：复制截图后在终端里 `Ctrl + V`，自动上传到后端并把文件路径填入命令行，方便交给 AI / CLI 处理
-- ✅ **会话持久化**：基于内置 tmux，关闭浏览器、断网重连，终端状态原样保留
+- ✅ **图片可以直接传入终端**：复制截图后在终端里 `Ctrl + V`，自动上传到后端并把文件路径填入命令行
+- ✅ **会话持久化**：基于 tmux，关闭浏览器、断网重连，终端状态原样保留
 - ✅ **多标签会话**：一个浏览器窗口同时跑多个终端，标签可重命名
 - ✅ **主题自定义**：内置多套配色、字体大小、光标样式、自定义背景图（上传 / URL）
 - ✅ **右键复制粘贴**：选中即复制，右键即粘贴，符合桌面终端习惯
-- ✅ **fnOS 原生集成**：作为 FPK 应用安装，桌面图标直接打开，自动识别系统用户身份
+- ✅ **本地用户识别**：服务端自动使用当前 Linux 登录用户作为终端运行身份
 
 ## 技术栈
 
@@ -27,44 +27,67 @@
 |---|---|
 | 后端 | Rust + Axum + Tokio + WebSocket + SQLite |
 | 前端 | Vue 3 + Vite + xterm.js |
-| 终端核心 | 内置 tmux（会话持久化） |
-| 打包 | fnpack（飞牛官方 FPK 格式） |
+| 终端核心 | tmux（会话持久化） |
 
-后端编译后是一个单文件二进制，连同 tmux 一起打包进 FPK，安装到 fnOS 即可使用，无需任何依赖。
+后端是一个 Rust 服务，前端由 Vite 构建到 `ui/` 目录。默认情况下，运行后会在本机 `18732` 端口提供 Web 终端。
 
 ## 开发说明
 
 开发过程中，编码工作主要由 **GPT-5.5** 和 **DeepSeek-V4-Pro** 两个模型完成。
 
-## 安装使用
-
-1. 本地手动安装 `rmux.fpk`
-2. 安装后从 fnOS 桌面点击「**终端**」图标启动
-3. 首次启动可选择设置访问密码，或跳过进入公开模式
-4. 默认服务端口：`18732`
-
 ## 从源码构建
 
 ```bash
-# 一键构建（需要 cargo / node / fnpack）
-./build_fpk.sh
+# 构建前端
+cd frontend
+npm install
+npm run build
+
+# 构建后端
+cd ../backend
+cargo build --release
 ```
 
-构建脚本会依次完成：生成图标 → 编译 Rust 后端 → 编译 Vue 前端 → 同步文件 → `fnpack` 打包。
-产物输出在 `build_fpk/rmux.fpk`。
+前端产物输出到仓库根目录的 `ui/`。后端默认读取 `../ui` 或通过环境变量指定的静态资源目录。
 
-> ⚠️ `build_fpk.sh` 会直接使用 `build_fpk/manifest` 里的现有版本号。只有在你明确要发新版本时，才手动修改 `version`。详细打包注意事项见 [FPK_PACKAGING.md](./FPK_PACKAGING.md)。
+## 运行
+
+```bash
+cd backend
+RMUX_APPDIR=.. \
+RMUX_DATA_DIR=../var \
+RMUX_UI_DIR=../ui \
+cargo run --release
+```
+
+启动后访问：
+
+```text
+http://127.0.0.1:18732
+```
+
+可用环境变量：
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `RMUX_APPDIR` | 应用根目录 | `.` |
+| `RMUX_DATA_DIR` | 数据、日志、上传文件目录 | `var` |
+| `RMUX_UI_DIR` | 前端静态资源目录 | `$RMUX_APPDIR/ui` |
+| `RMUX_TMUX` | 自定义 tmux 可执行文件路径 | `tmux` |
+| `RMUX_TMUX_LIB_DIR` | 自定义 tmux 依赖库目录 | 未设置 |
+| `RMUX_PORT` | HTTP 服务端口 | `18732` |
+| `RMUX_HOST` | HTTP 监听地址 | `0.0.0.0` |
+| `JWT_SECRET` | JWT 密钥 | 自动生成/默认空值 |
 
 ## 目录结构
 
-```
+```text
 rmux/
 ├── backend/       # Rust 后端（Axum + tmux 会话管理）
 ├── frontend/      # Vue 3 前端（xterm.js 终端 UI）
 ├── ui/            # 前端构建产物（vite build 输出）
-├── build_fpk/     # FPK 打包源（manifest / cmd / config / 图标）
-├── scripts/       # 辅助脚本（图标生成等）
-└── build_fpk.sh   # 一键构建脚本
+├── assets/        # 源图标等静态素材
+└── scripts/       # 辅助脚本（图标生成等）
 ```
 
 ## License

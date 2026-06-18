@@ -1,6 +1,0 @@
-#!/bin/bash
-
-### This script is called after the user change environment variables in application setting page.
-
-# 当前版本无配置项，直接返回成功
-exit 0
