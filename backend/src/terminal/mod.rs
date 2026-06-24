@@ -447,6 +447,37 @@ pub async fn capture_tmux_history(
     }
 }
 
+pub async fn capture_tmux_snapshot(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+    lines: u32,
+) -> Result<String, String> {
+    let history = capture_tmux_history(config, session_id, session_name, lines).await?;
+    match query_tmux_cursor(config, session_id, session_name).await {
+        Ok((x, y)) => Ok(format!("{}\x1b[{};{}H", history, y + 1, x + 1)),
+        Err(_) => Ok(history),
+    }
+}
+
+pub async fn should_snapshot_after_input(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+    submitted: bool,
+) -> bool {
+    match query_tmux_pane_state(config, session_id, session_name).await {
+        Ok(state) => {
+            if state.alternate_on || state.pane_modes != 0 {
+                return false;
+            }
+
+            state.is_shell() || (submitted && state.should_snapshot_after_submit())
+        }
+        Err(_) => true,
+    }
+}
+
 async fn capture_tmux_history_inner(
     config: &AppConfig,
     session_id: &str,
@@ -482,12 +513,126 @@ async fn capture_tmux_history_inner(
     }
 }
 
+struct TmuxPaneState {
+    current_command: String,
+    alternate_on: bool,
+    pane_modes: u32,
+}
+
+impl TmuxPaneState {
+    fn is_shell(&self) -> bool {
+        matches!(
+            self.current_command.as_str(),
+            "sh" | "bash"
+                | "zsh"
+                | "fish"
+                | "dash"
+                | "ash"
+                | "ksh"
+                | "mksh"
+                | "csh"
+                | "tcsh"
+                | "nu"
+        )
+    }
+
+    fn should_snapshot_after_submit(&self) -> bool {
+        matches!(self.current_command.as_str(), "claude")
+    }
+}
+
+async fn query_tmux_pane_state(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+) -> Result<TmuxPaneState, String> {
+    let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
+    let mut cmd = tokio::process::Command::new(config.tmux_path());
+    if let Some(lib) = config.tmux_lib_dir() {
+        cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    cmd.args([
+        "-u",
+        "-S",
+        &socket.display().to_string(),
+        "display-message",
+        "-p",
+        "-t",
+        session_name,
+        "#{pane_current_command}\t#{alternate_on}\t#{pane_in_mode}",
+    ]);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("pane state query error: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut parts = raw.trim_end().split('\t');
+    let current_command = parts.next().unwrap_or_default().to_string();
+    let alternate_on = parts.next().unwrap_or("0") == "1";
+    let pane_modes = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+
+    Ok(TmuxPaneState {
+        current_command,
+        alternate_on,
+        pane_modes,
+    })
+}
+
+async fn query_tmux_cursor(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+) -> Result<(u32, u32), String> {
+    let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
+    let mut cmd = tokio::process::Command::new(config.tmux_path());
+    if let Some(lib) = config.tmux_lib_dir() {
+        cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    cmd.args([
+        "-u",
+        "-S",
+        &socket.display().to_string(),
+        "display-message",
+        "-p",
+        "-t",
+        session_name,
+        "#{cursor_x} #{cursor_y}",
+    ]);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("cursor query error: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut parts = raw.split_whitespace();
+    let x = parts
+        .next()
+        .ok_or_else(|| "missing cursor_x".to_string())?
+        .parse::<u32>()
+        .map_err(|e| format!("invalid cursor_x: {}", e))?;
+    let y = parts
+        .next()
+        .ok_or_else(|| "missing cursor_y".to_string())?
+        .parse::<u32>()
+        .map_err(|e| format!("invalid cursor_y: {}", e))?;
+    Ok((x, y))
+}
+
 fn compact_captured_history(history: &str) -> String {
     let mut out = Vec::new();
     let mut blank_run = 0usize;
 
     for line in history.lines() {
-        if line.trim().is_empty() {
+        if line.is_empty() {
             blank_run += 1;
             if blank_run <= 2 {
                 out.push(line);
@@ -499,11 +644,7 @@ fn compact_captured_history(history: &str) -> String {
         out.push(line);
     }
 
-    while out
-        .last()
-        .map(|line| line.trim().is_empty())
-        .unwrap_or(false)
-    {
+    while out.last().map(|line| line.is_empty()).unwrap_or(false) {
         out.pop();
     }
 

@@ -2,11 +2,11 @@
     ".url": {
         "rmux.Application": {
             "title": "Rmux",
-            "icon": "images/rmux_v0_0_2_{0}.png",
+            "icon": "images/rmux_v0_0_3_{0}.png",
             "type": "iframe",
             "protocol": "http",
             "port": "18732",
-            "url": "/app/rmux/?v=0.0.2",
+            "url": "/app/rmux/?v=0.0.3",
             "control": {
                 "fullUrlPerm": "editable",
                 "pathPerm": "hidden",

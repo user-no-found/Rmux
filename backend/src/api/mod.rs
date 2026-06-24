@@ -8,10 +8,9 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use notify::{RecursiveMode, Watcher};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tracing::{info, warn};
 
 use crate::auth::*;
@@ -28,6 +27,9 @@ pub struct AppState {
     pub db: DbPool,
     pub sessions: terminal::SessionRegistry,
 }
+
+const INPUT_SNAPSHOT_DELAY_MS: u64 = 15;
+const ENTER_SNAPSHOT_DELAY_MS: u64 = 80;
 
 // ─── Router ─────────────────────────────────────────────────────────────
 
@@ -386,90 +388,65 @@ async fn handle_terminal_resume(
         }
     }
 
-    let (tx, mut rx) = broadcast::channel::<String>(1024);
-    let output_file_clone = output_file.clone();
-    let tx_clone = tx.clone();
     let config_clone = state.config.clone();
     let session_id_param_clone = session_id_param.clone();
     let tmux_name_clone = tmux_name.clone();
     let mut history_sent = false;
 
-    let output_task = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-        const MAX_OUTPUT_DELTA_BYTES: u64 = 256 * 1024;
+    const MAX_OUTPUT_DELTA_BYTES: u64 = 256 * 1024;
+    const OUTPUT_POLL_INTERVAL_MS: u64 = 30;
 
-        let mut file = match tokio::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&output_file_clone)
-            .await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("打开输出文件失败: {}", e);
-                return;
-            }
-        };
-        let mut last_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        let (tx_notify, mut rx_notify) = tokio::sync::mpsc::channel(1);
-        let mut watcher =
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, notify::EventKind::Modify(_)) {
-                        let _ = tx_notify.try_send(());
-                    }
-                }
-            }) {
-                Ok(watcher) => watcher,
-                Err(e) => {
-                    warn!("创建输出监听失败: {}", e);
-                    return;
-                }
-            };
-        if let Err(e) = watcher.watch(&output_file_clone, RecursiveMode::NonRecursive) {
-            warn!("监听输出文件失败: {}", e);
-            return;
+    let mut output_file_handle = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&output_file)
+        .await
+    {
+        Ok(file) => Some(file),
+        Err(e) => {
+            warn!("打开输出文件失败: {}", e);
+            None
         }
-        loop {
-            // 等待变更通知
-            if rx_notify.recv().await.is_none() {
-                break;
-            }
+    };
+    let mut last_output_size = if let Some(file) = output_file_handle.as_mut() {
+        file.metadata().await.map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut output_poll =
+        tokio::time::interval(tokio::time::Duration::from_millis(OUTPUT_POLL_INTERVAL_MS));
 
-            // 关键优化：防抖处理
-            // 收到通知后等待一小段时间，确保 tmux 完成了一次“原子”写入（比如先发清屏再发文字）
-            // 这样我们能一次性读出完整更新，避免渲染闪烁
-            tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
-
-            // 清空队列中的多余通知
-            while let Ok(_) = rx_notify.try_recv() {}
-
-            if let Ok(meta) = file.metadata().await {
-                let len = meta.len();
-                if len < last_size {
-                    last_size = 0;
-                    let _ = file.seek(SeekFrom::Start(0)).await;
-                }
-
-                while len > last_size {
-                    let read_len = std::cmp::min(len - last_size, MAX_OUTPUT_DELTA_BYTES);
-                    let mut buffer = vec![0; read_len as usize];
-                    let _ = file.seek(SeekFrom::Start(last_size)).await;
-                    if file.read_exact(&mut buffer).await.is_ok() {
-                        let delta = String::from_utf8_lossy(&buffer).to_string();
-                        let _ = tx_clone.send(delta);
-                        last_size += read_len;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    loop {
+    'connection: loop {
         tokio::select! {
+            _ = output_poll.tick() => {
+                let Some(file) = output_file_handle.as_mut() else {
+                    continue;
+                };
+
+                if let Ok(meta) = file.metadata().await {
+                    let len = meta.len();
+                    if len < last_output_size {
+                        last_output_size = 0;
+                        let _ = file.seek(SeekFrom::Start(0)).await;
+                    }
+
+                    while len > last_output_size {
+                        let read_len = std::cmp::min(len - last_output_size, MAX_OUTPUT_DELTA_BYTES);
+                        let mut buffer = vec![0; read_len as usize];
+                        let _ = file.seek(SeekFrom::Start(last_output_size)).await;
+                        if file.read_exact(&mut buffer).await.is_err() {
+                            break;
+                        }
+
+                        let delta = String::from_utf8_lossy(&buffer).to_string();
+                        last_output_size += read_len;
+                        if ws.send(Message::Text(delta.into())).await.is_err() {
+                            break 'connection;
+                        }
+                    }
+                }
+            }
             msg = ws.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -477,15 +454,35 @@ async fn handle_terminal_resume(
                             match cmd {
                                 TerminalMessage::Input { data } => {
                                     let _ = terminal::write_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
+                                    if let Some(delay_ms) = input_snapshot_delay_ms(&data) {
+                                        let submitted = is_submit_input(&data);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone, submitted).await {
+                                            if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
+                                                break;
+                                            }
+                                            skip_captured_output(&mut output_file_handle, &mut last_output_size).await;
+                                        }
+                                    }
                                 }
                                 TerminalMessage::Paste { data } => {
                                     let _ = terminal::paste_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
+                                    if let Some(delay_ms) = input_snapshot_delay_ms(&data) {
+                                        let submitted = is_submit_input(&data);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone, submitted).await {
+                                            if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
+                                                break;
+                                            }
+                                            skip_captured_output(&mut output_file_handle, &mut last_output_size).await;
+                                        }
+                                    }
                                 }
                                 TerminalMessage::Resize { cols, rows } => {
                                     let _ = terminal::resize_tmux(&state.config, &session_id_param, &tmux_name, cols, rows).await;
                                     if !history_sent {
-                                        if let Ok(history) = terminal::capture_tmux_history(&config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
-                                            let _ = ws.send(Message::Text(format!("\x1b[2J\x1b[H{}", history).into())).await;
+                                        if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
+                                            break;
                                         }
                                         history_sent = true;
                                     }
@@ -500,15 +497,55 @@ async fn handle_terminal_resume(
                     _ => {}
                 }
             }
-            data = rx.recv() => {
-                if let Ok(text) = data {
-                    let _ = ws.send(Message::Text(text.into())).await;
-                }
-            }
         }
     }
+}
 
-    output_task.abort();
+fn input_snapshot_delay_ms(data: &str) -> Option<u64> {
+    if data.is_empty() {
+        None
+    } else if is_submit_input(data) {
+        Some(ENTER_SNAPSHOT_DELAY_MS)
+    } else {
+        Some(INPUT_SNAPSHOT_DELAY_MS)
+    }
+}
+
+fn is_submit_input(data: &str) -> bool {
+    data.contains('\n') || data.contains('\r')
+}
+
+async fn skip_captured_output(
+    output_file_handle: &mut Option<tokio::fs::File>,
+    last_output_size: &mut u64,
+) {
+    let Some(file) = output_file_handle.as_mut() else {
+        return;
+    };
+
+    if let Ok(meta) = file.metadata().await {
+        *last_output_size = meta.len();
+        let _ = file.seek(SeekFrom::Start(*last_output_size)).await;
+    }
+}
+
+async fn send_terminal_snapshot(
+    ws: &mut WebSocket,
+    config: &AppConfig,
+    session_id: &str,
+    tmux_name: &str,
+    lines: u32,
+) -> bool {
+    match terminal::capture_tmux_snapshot(config, session_id, tmux_name, lines).await {
+        Ok(history) => ws
+            .send(Message::Text(format!("\x1b[2J\x1b[H{}", history).into()))
+            .await
+            .is_ok(),
+        Err(e) => {
+            warn!("同步终端画面失败: {}", e);
+            true
+        }
+    }
 }
 
 // ─── Clipboard & Theme & System Handlers ────────────────────────────────
