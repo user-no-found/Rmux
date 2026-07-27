@@ -135,7 +135,7 @@ set -g prefix2 None
 set -g status off
 set -sg escape-time 0
 set -g history-limit 10000
-set -g mouse off
+set -g mouse on
 set -g default-terminal "tmux-256color"
 set -as terminal-features ",xterm-256color:RGB"
 set -g window-size latest
@@ -458,12 +458,19 @@ pub fn attach_pty_session(
 
     // `-d` 顶掉同会话的其它客户端：任一时刻只有一个客户端，
     // 尺寸永远等于当前浏览器窗口，不会出现多客户端互相压缩导致的重排抖动。
+    // `-f` 只在 tmux server 首次启动时生效；恢复出来的旧 server 不会重读配置。
+    // attach 前显式同步 mouse，现有会话也能立刻获得滚轮/copy-mode 支持。
     let args: Vec<String> = vec![
         "-f".into(),
         conf.display().to_string(),
         "-u".into(),
         "-S".into(),
         socket.display().to_string(),
+        "set-option".into(),
+        "-g".into(),
+        "mouse".into(),
+        "on".into(),
+        ";".into(),
         "attach-session".into(),
         "-d".into(),
         "-t".into(),
