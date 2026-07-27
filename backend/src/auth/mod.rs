@@ -168,6 +168,11 @@ pub fn home_for_user(username: &str) -> Option<String> {
 }
 
 /// 智能身份探测：优先 headers，其次使用当前进程身份兜底
+///
+/// x-fn-* 头只有在请求确实经由 fnOS 反向代理时才可信；服务同时也直接监听
+/// 0.0.0.0，任何人都能伪造这些头。因此这里只把用户名当作"想切换到哪个账户"
+/// 的提示，uid 一律以 /etc/passwd 为准，不接受调用方自报的 x-fn-uid ——
+/// 否则调用方就能自行挑选 owner_uid，越权读取他人的会话与剪贴板。
 pub fn detect_real_user(parts: &Parts) -> Option<(String, i64)> {
     // 1. 优先尝试从 fnOS 系统头获取身份 (系统级自动登录)
     let sys_user = parts
@@ -178,14 +183,21 @@ pub fn detect_real_user(parts: &Parts) -> Option<(String, i64)> {
         .map(|s| s.to_string());
 
     if let Some(user) = sys_user {
-        let uid = parts
-            .headers
-            .get("x-fn-uid")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .or_else(|| user_from_name(&user).map(|local_user| local_user.uid))
-            .unwrap_or(1000);
-        return Some((user, uid));
+        // 用户名必须对应真实本地账户，且必须是普通可登录账户（uid>=1000、
+        // 有 home、shell 不是 nologin）：uid 取自 /etc/passwd 而不是请求头。
+        //
+        // 两条限制缺一不可。只查 passwd 不够 —— 调用方直接声明
+        // `x-fn-username: root` 就能拿到 uid 0；而只信请求头里的 x-fn-uid，
+        // 调用方等于可以随便挑 owner_uid，越权读别人的会话和剪贴板。
+        match user_from_name(&user).filter(is_login_user) {
+            Some(local_user) => return Some((local_user.name, local_user.uid)),
+            None => {
+                warn!(
+                    "请求声明的系统用户 {} 不是本机普通登录账户，忽略该身份头",
+                    user
+                );
+            }
+        }
     }
 
     // 2. 兜底逻辑：本地直连或 fnOS 未透传系统头时，锁定真实可登录用户。
@@ -224,11 +236,15 @@ where
             let config = config.ok_or(AuthError("Server config not found".into()))?;
 
             // 1. 系统级自动登录 (带智能探测)
+            //
+            // 只有在压根没有配置密码时才允许免密。原先的条件是
+            // `!has_password || has_skip_marker`，于是一个残留的 .skip_auth
+            // 能直接击穿已设置的密码 —— 而 /api/auth/status 在这种状态下
+            // 仍然返回 "login"，前端老老实实弹密码框，后面的 API 却是敞开的。
             if let Some((user, uid)) = detected {
                 let has_password = std::fs::metadata(&config.auth_file).is_ok();
-                let has_skip_marker = std::fs::metadata(&config.skip_auth_file).is_ok();
 
-                if !has_password || has_skip_marker {
+                if !has_password {
                     return Ok(AuthUserExtractor(AuthUser {
                         uid,
                         user,

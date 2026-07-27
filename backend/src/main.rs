@@ -14,12 +14,8 @@ use axum::{
 };
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{fs::ServeFileSystemResponseBody, ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::services::{
-    fs::ServeFileSystemResponseBody,
-    ServeDir, ServeFile,
-};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -51,14 +47,24 @@ async fn main() {
     // Initialize Database
     let pool = db::create_pool(&config);
 
-    // Create session registry
+    // Create session registry，并把上次运行留下的、tmux 里仍然活着的会话捞回来。
+    // 不恢复的话：重启后 tmux server 还在跑，会话却既列不出来也连不上，
+    // 而且永远不会被回收。
     let sessions = terminal::new_session_registry();
+    let restored = terminal::restore_sessions(&config).await;
+    if !restored.is_empty() {
+        tracing::info!("恢复了 {} 个仍在运行的终端会话", restored.len());
+    }
+    *sessions.write().await = restored;
+    // 立即回写一次，把已经消失的条目从文件里剔掉。
+    terminal::persist_sessions(&config, &sessions).await;
 
     // Build app state
     let state = api::AppState {
         config: config.clone(),
         db: pool,
         sessions,
+        attaches: terminal::new_attach_registry(),
     };
 
     let index_file = config.ui_dir.join("index.html");
@@ -91,19 +97,22 @@ async fn main() {
     let images_service = ServeDir::new(&images_dir);
 
     // Build router
+    //
+    // 静态服务要先挂上再 .layer()：Router::layer 只包裹此前已注册的路由，
+    // 原先的顺序让所有静态资源既拿不到 Extension 也不产生 tracing span。
+    //
+    // 这里刻意不再挂 CorsLayer。原先是 allow_origin(Any) + allow_methods(Any)
+    // + allow_headers(Any)：前端与 API 本来就同源（fnOS 反代到 /app/rmux，
+    // 开发态走 vite proxy），根本不需要 CORS；而放开之后，一旦处于免密模式，
+    // 用户浏览到的任意网页都能跨源调用本机 API 建终端、读输出 —— 等于一个
+    // 挂在浏览器上的远程执行入口。
     let app = api::build_router(state.clone())
-        .layer(Extension(config.clone()))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .layer(tower_http::trace::TraceLayer::new_for_http())
         .nest_service("/app/rmux/images", images_service.clone())
         .nest_service("/images", images_service)
         .nest_service("/app/rmux", static_files.clone())
-        .fallback_service(static_files);
+        .fallback_service(static_files)
+        .layer(Extension(config.clone()))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
 
     // Start server
     let addr = format!("{}:{}", config.host, config.port);

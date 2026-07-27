@@ -120,6 +120,7 @@ import { computed, ref, reactive, onMounted, onBeforeUnmount, nextTick, watch } 
 import { useRouter } from 'vue-router'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
+import { WebglAddon } from 'xterm-addon-webgl'
 import 'xterm/css/xterm.css'
 import axios from 'axios'
 import { API_BASE, WS_BASE } from '../runtimeBase'
@@ -133,8 +134,12 @@ const termRefs = reactive({})
 const termInstances = reactive({})
 const fitAddons = reactive({})
 const wsConnections = reactive({})
-const pendingTermWrites = {}
-const writeFrameIds = {}
+// 下面几张表只服务于连接生命周期，不参与渲染，故意不放进 reactive。
+const lastSentSize = {}
+const reconnectTimers = {}
+const reconnectAttempts = {}
+const attachedOnce = {}
+const deadSessions = {}
 const toastMsg = ref('')
 const systemInfo = ref({ hostname: 'localhost', os: 'Linux', arch: 'x86_64' })
 const repoHref = 'https://github.com/user-no-found/Rmux'
@@ -147,8 +152,9 @@ const renameInputRefs = reactive({})
 const dotClasses = ['online', 'blue', 'purple', 'orange']
 const CLIPBOARD_HISTORY_LIMIT = 20
 const MAX_TEXT_HISTORY_CHARS = 100000
-const MAX_TERMINAL_WRITE_CHARS = 128 * 1024
 const SESSION_REFRESH_MS = 15000
+const RECONNECT_BASE_MS = 600
+const RECONNECT_MAX_MS = 8000
 const COMBINING_CODEPOINT_RANGES = [
   [0x0300, 0x036f], [0x0483, 0x0489], [0x0591, 0x05bd], [0x05bf, 0x05bf],
   [0x05c1, 0x05c2], [0x05c4, 0x05c5], [0x05c7, 0x05c7], [0x0610, 0x061a],
@@ -621,33 +627,6 @@ const loadSystemInfo = async () => {
   } catch (e) {}
 }
 
-const scheduleTerminalFlush = (id) => {
-  if (!termInstances[id] || writeFrameIds[id]) return
-
-  writeFrameIds[id] = requestAnimationFrame(() => {
-    delete writeFrameIds[id]
-    const term = termInstances[id]
-    const pending = pendingTermWrites[id] || ''
-    if (!term || !pending) {
-      pendingTermWrites[id] = ''
-      return
-    }
-
-    const chunk = pending.slice(0, MAX_TERMINAL_WRITE_CHARS)
-    pendingTermWrites[id] = pending.slice(chunk.length)
-    term.write(chunk, () => {
-      if (pendingTermWrites[id] && termInstances[id]) scheduleTerminalFlush(id)
-    })
-  })
-}
-
-const writeTerminalData = (id, data) => {
-  if (!termInstances[id] || !data) return
-
-  pendingTermWrites[id] = (pendingTermWrites[id] || '') + data
-  scheduleTerminalFlush(id)
-}
-
 const loadSessions = async () => {
   try {
     const res = await axios.get(`${API_BASE}/api/sessions`, authHeaders())
@@ -662,6 +641,159 @@ const loadSessions = async () => {
   } catch (e) {}
 }
 
+/// DOM 渲染器在 claude code 这种整屏高频重绘下会漏行、也跟不上节奏，
+/// 表现就是"该有的内容没显示"。WebGL 渲染器整屏走 GPU，没有这个问题。
+/// 上下文丢失（切后台、GPU 复位）时必须 dispose，xterm 才会退回 DOM 渲染器；
+/// 不 dispose 的话终端会彻底停止绘制。
+const loadWebglRenderer = (term) => {
+  try {
+    const addon = new WebglAddon()
+    addon.onContextLoss(() => {
+      try { addon.dispose() } catch (e) {}
+    })
+    term.loadAddon(addon)
+  } catch (e) {}
+}
+
+/// 同步把网格调到容器的真实尺寸。刻意不走 requestAnimationFrame：
+/// 调用方紧接着就要读 term.cols/rows 上报，异步 fit 会让它读到旧值。
+const applyFit = (id) => {
+  const term = termInstances[id]
+  const fitAddon = fitAddons[id]
+  if (!term || !fitAddon) return null
+  try {
+    const dims = fitAddon.proposeDimensions()
+    if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return null
+    const cols = Math.max(2, dims.cols)
+    const rows = Math.max(1, dims.rows)
+    if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows)
+    return { cols, rows }
+  } catch (e) {
+    return null
+  }
+}
+
+const sendResize = (id, cols, rows) => {
+  const ws = wsConnections[id]
+  if (ws?.readyState !== WebSocket.OPEN) return
+  const last = lastSentSize[id]
+  if (last && last.cols === cols && last.rows === rows) return
+  lastSentSize[id] = { cols, rows }
+  ws.send(JSON.stringify({ type: 'resize', cols, rows }))
+}
+
+/// fit + 上报。上报不能只依赖 term.onResize —— fit 后尺寸恰好没变时它不触发，
+/// 后端就永远等不到尺寸。这里补一次，靠 lastSentSize 去重，净效果是
+/// "每次尺寸确实变了、或本连接还没报过，就发且只发一条"。
+const syncTerminalSize = (id) => {
+  const term = termInstances[id]
+  if (!term) return
+  applyFit(id)
+  sendResize(id, term.cols, term.rows)
+  try { term.refresh(0, term.rows - 1) } catch (e) {}
+}
+
+const clearReconnect = (id) => {
+  if (reconnectTimers[id]) {
+    clearTimeout(reconnectTimers[id])
+    delete reconnectTimers[id]
+  }
+}
+
+/// 连接断了不代表 tmux 会话没了 —— 反向代理的空闲超时、网络抖动都会断连，
+/// 而 tmux 侧一切照旧。不重连的话终端看着还在，输出却再也不来。
+const scheduleReconnect = (id) => {
+  if (!termInstances[id] || deadSessions[id] || reconnectTimers[id]) return
+  const attempt = (reconnectAttempts[id] || 0) + 1
+  reconnectAttempts[id] = attempt
+  const delay = Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS)
+  reconnectTimers[id] = setTimeout(() => {
+    delete reconnectTimers[id]
+    if (termInstances[id] && !deadSessions[id]) connectTerminal(id)
+  }, delay)
+}
+
+const connectTerminal = (id) => {
+  const term = termInstances[id]
+  if (!term || deadSessions[id]) return
+
+  const token = sessionStorage.getItem('rmux_token') || ''
+  const ws = new WebSocket(`${WS_BASE}/ws/terminal/${id}?token=${encodeURIComponent(token)}`)
+  // 终端输出是任意字节流。按文本收会在分块边界切断多字节 UTF-8，
+  // 中文和框线字符会碎掉；交给 xterm.js 自己跨块解码才是正确的。
+  ws.binaryType = 'arraybuffer'
+  wsConnections[id] = ws
+  // 旧连接的回调可能晚于新连接到达，认准自己这一条。
+  const isCurrent = () => wsConnections[id] === ws
+
+  ws.onopen = () => {
+    if (!isCurrent()) return
+    reconnectAttempts[id] = 0
+    // 重连 = tmux 重新 attach = 又一次整屏重绘。屏上的旧帧不清掉，
+    // 新旧两帧就会叠在一起，这正是"同时出现两个显示"的来源。
+    if (attachedOnce[id]) term.reset()
+    attachedOnce[id] = true
+    // 置空让下面这次上报必定发出：新连接的后端一无所知，去重表得先清。
+    lastSentSize[id] = null
+    // 后端在收到这条消息之前不会 attach，所以它必须是连上后的第一件事。
+    syncTerminalSize(id)
+    if (activeSession.value === id) term.focus()
+  }
+
+  ws.onmessage = (e) => {
+    if (!isCurrent()) return
+    // 文本帧只用于控制消息，终端数据一律是二进制帧。
+    if (typeof e.data === 'string') {
+      if (e.data === 'SESSION_NOT_FOUND' || e.data === 'SESSION_GONE') {
+        deadSessions[id] = true
+        clearReconnect(id)
+        term.write('\r\n\x1b[31m[会话已结束]\x1b[0m')
+      } else if (e.data === 'SESSION_REPLACED') {
+        // 会话被另一个窗口接管了。这里必须停止重连，否则两个窗口会互相顶。
+        // 重新点一下本标签可以再抢回来（reviveSession）。
+        deadSessions[id] = true
+        clearReconnect(id)
+        term.write('\r\n\x1b[33m[会话已在其它窗口打开，点击本标签可重新接管]\x1b[0m')
+      }
+      return
+    }
+    term.write(new Uint8Array(e.data))
+  }
+
+  ws.onclose = () => {
+    if (!isCurrent()) return
+    delete wsConnections[id]
+    if (deadSessions[id] || !termInstances[id]) return
+    // 只在断开这一刻提示一次；重连成功会 reset 掉，不会积一屏。
+    if (!reconnectAttempts[id]) {
+      term.write('\r\n\x1b[33m[连接已断开，正在重连…]\x1b[0m')
+    }
+    scheduleReconnect(id)
+  }
+
+  ws.onerror = () => {
+    // onerror 后必定跟一个 onclose，重连交给它，这里只避免未处理错误。
+  }
+}
+
+/// deadSessions 是个只进不出的闩：SESSION_REPLACED / SESSION_GONE 之后就一直挂着，
+/// 而唯一清它的地方是 initTerminal —— 切标签走的是"实例已存在"那条分支，永远到不了。
+/// 于是被别的窗口接管过的标签会永久停在提示上，只有整页刷新能救。
+///
+/// 这里给它一条恢复路径，但只在用户主动点回这个标签时触发：自动重连会让两个
+/// 窗口无休止地互相顶掉，那正是这个闩当初要防的事。
+const reviveSession = (id) => {
+  if (!deadSessions[id] || !termInstances[id]) return false
+  const ws = wsConnections[id]
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return false
+  clearReconnect(id)
+  deadSessions[id] = false
+  reconnectAttempts[id] = 0
+  termInstances[id].write('\r\n\x1b[36m[正在重新接管会话…]\x1b[0m\r\n')
+  connectTerminal(id)
+  return true
+}
+
 const initTerminal = async (id) => {
   const el = termRefs[id]
   if (!el || termInstances[id]) return
@@ -674,6 +806,9 @@ const initTerminal = async (id) => {
     scrollback: 2000,
     allowProposedApi: true,
     convertEol: false,
+    // 主题背景是透明的，要让 WebGL 渲染器保留 alpha 必须显式打开，
+    // 否则它会把背景压成不透明黑，玻璃质感的面板就没了。
+    allowTransparency: true,
     linkHandler: {
       activate: (_event, text) => openSafeUrl(text),
       allowNonHttpProtocols: false,
@@ -706,39 +841,12 @@ const initTerminal = async (id) => {
   configureTerminalUnicode(term)
   term.loadAddon(fitAddon)
   term.open(el)
+  loadWebglRenderer(term)
   registerUrlLinks(term)
 
   termInstances[id] = term
   fitAddons[id] = fitAddon
-
-  const token = sessionStorage.getItem('rmux_token') || ''
-  const ws = new WebSocket(`${WS_BASE}/ws/terminal/${id}?token=${encodeURIComponent(token)}`)
-  wsConnections[id] = ws
-
-  ws.onopen = () => {
-    setTimeout(() => {
-      if (fitAddons[id]) {
-        fitTerminal(id)
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
-        }
-      }
-      term.focus()
-    }, 80)
-  }
-
-  ws.onmessage = (e) => {
-    if (e.data === 'SESSION_NOT_FOUND' || e.data === 'SESSION_GONE') {
-      term.write('\r\n\x1b[31m[会话已结束]\x1b[0m')
-      return
-    }
-    writeTerminalData(id, e.data)
-  }
-  ws.onclose = () => {
-    if (termInstances[id]) {
-      term.write('\r\n\x1b[31m[连接已断开]\x1b[0m')
-    }
-  }
+  deadSessions[id] = false
 
   term.onData((data) => {
     if (data === '\x16' && Date.now() < suppressCtrlVInputUntil) {
@@ -746,14 +854,15 @@ const initTerminal = async (id) => {
     }
     sendTerminalMessage('input', data, id)
   })
+  // 网格尺寸只要变了就立刻上报，不做防抖：后端拿到尺寸才会驱动 tmux 重绘，
+  // 晚一拍就意味着 tmux 在错误的网格上画了一屏。
+  term.onResize(({ cols, rows }) => sendResize(id, cols, rows))
 
-  let resizeTimer = null
-  term.onResize(({ cols, rows }) => {
-    clearTimeout(resizeTimer)
-    resizeTimer = setTimeout(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }))
-    }, 220)
-  })
+  // 必须在建连之前把网格调到真实尺寸。后端收到第一条 resize 才 attach tmux，
+  // 而 tmux attach 的第一件事就是整屏重绘 —— 那一屏画在什么网格上，
+  // 决定了之后所有增量更新对不对得上。
+  applyFit(id)
+  connectTerminal(id)
 
   const termViewport = el.querySelector('.xterm-viewport') || el
   termViewport.addEventListener('contextmenu', async (e) => {
@@ -772,24 +881,32 @@ const initTerminal = async (id) => {
       return false
     }
     if (e.type === 'keydown' && e.ctrlKey && e.key === 'Enter') {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data: '\n' }))
+      sendTerminalMessage('input', '\n', id)
       return false
     }
     return true
   })
 }
 
-const switchSession = async (id) => {
-  activeSession.value = id
+/// 激活一个标签。switchSession 和 watch(activeSession) 原本各写了一遍
+/// 逐字相同的函数体，且切换标签时两边都会跑一次；合并成一处。
+const activateSession = async (id) => {
+  if (!id) return
   await nextTick()
   if (!termInstances[id]) {
     await initTerminal(id)
-  } else {
-    setTimeout(() => {
-      fitTerminal(id)
-      termInstances[id]?.focus()
-    }, 20)
+    return
   }
+  // 被接管过的标签在这里拿到重新接管的机会；没死就只是同步一下网格。
+  if (!reviveSession(id)) syncTerminalSize(id)
+  termInstances[id]?.focus()
+}
+
+const switchSession = async (id) => {
+  const unchanged = activeSession.value === id
+  activeSession.value = id
+  // 值确实变了就交给 watch，不必在这里再跑一遍；没变则 watch 不触发，补一次。
+  if (unchanged) await activateSession(id)
 }
 
 const createNewSession = async () => {
@@ -797,19 +914,26 @@ const createNewSession = async () => {
     let cols = 80
     let rows = 24
     if (termContainer.value) {
-      const term = new Terminal({ fontSize: 14, fontFamily: 'Menlo, Monaco, "Courier New", monospace' })
+      // 量尺寸的探针必须和真正的 .term-wrapper 同字号、同行高、同几何，
+      // 否则算出来的 cols/rows 会偏，tmux 就按错误尺寸建窗口。
+      const term = new Terminal({
+        fontSize: 14,
+        fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+        lineHeight: 1.35,
+      })
       const fitAddon = new FitAddon()
       term.loadAddon(fitAddon)
       const dummy = document.createElement('div')
       dummy.style.visibility = 'hidden'
       dummy.style.position = 'absolute'
-      dummy.style.width = '100%'
-      dummy.style.height = '100%'
+      dummy.style.inset = '24px 28px'
       termContainer.value.appendChild(dummy)
       term.open(dummy)
-      fitAddon.fit()
-      cols = term.cols
-      rows = term.rows
+      const dims = fitAddon.proposeDimensions()
+      if (dims && Number.isFinite(dims.cols) && Number.isFinite(dims.rows)) {
+        cols = Math.max(2, dims.cols)
+        rows = Math.max(1, dims.rows)
+      }
       termContainer.value.removeChild(dummy)
       term.dispose()
     }
@@ -831,6 +955,9 @@ const closeSession = async (id) => {
   try {
     await axios.delete(`${API_BASE}/api/sessions/${id}`, authHeaders())
   } catch (e) {}
+  // 先标记再拆，否则 close 触发的 onclose 会把连接重新拉起来。
+  deadSessions[id] = true
+  clearReconnect(id)
   if (wsConnections[id]) {
     wsConnections[id].close()
     delete wsConnections[id]
@@ -840,11 +967,10 @@ const closeSession = async (id) => {
     delete termInstances[id]
   }
   if (fitAddons[id]) delete fitAddons[id]
-  if (writeFrameIds[id]) {
-    cancelAnimationFrame(writeFrameIds[id])
-    delete writeFrameIds[id]
-  }
-  delete pendingTermWrites[id]
+  delete termRefs[id]
+  delete lastSentSize[id]
+  delete reconnectAttempts[id]
+  delete attachedOnce[id]
   sessions.value = sessions.value.filter(s => s.session_id !== id)
   if (activeSession.value === id) activeSession.value = sessions.value[0]?.session_id || null
 }
@@ -920,29 +1046,6 @@ const registerUrlLinks = (term) => {
   })
 }
 
-const fitTerminal = (id) => {
-  const term = termInstances[id]
-  const fitAddon = fitAddons[id]
-  if (!term || !fitAddon) return
-  requestAnimationFrame(() => {
-    try {
-      fitAddon.fit()
-      term.refresh(0, term.rows - 1)
-    } catch (e) {}
-  })
-}
-
-const copySelection = async () => {
-  const term = termInstances[activeSession.value]
-  if (!term || !term.hasSelection()) {
-    showToast('没有选中文本')
-    return
-  }
-  await navigator.clipboard.writeText(term.getSelection())
-  term.clearSelection()
-  showToast('已复制')
-}
-
 const pasteClipboard = async (sessionId = activeSession.value) => {
   try {
     if (navigator.clipboard?.read) {
@@ -986,11 +1089,14 @@ const openInBrowser = () => {
 
 let globalResizeTimer = null
 let sessionRefreshTimer = null
+let viewportObserver = null
+/// 后台会话也要跟着重排。只 fit 当前标签的话，切过去时 tmux 还按旧尺寸画，
+/// 就会出现残影和光标错位 —— 而且要等到下一次 fit 才自愈。
 const handleResize = () => {
   clearTimeout(globalResizeTimer)
   globalResizeTimer = setTimeout(() => {
-    if (activeSession.value && fitAddons[activeSession.value]) fitTerminal(activeSession.value)
-  }, 240)
+    Object.keys(termInstances).forEach(id => syncTerminalSize(id))
+  }, 180)
 }
 
 onMounted(async () => {
@@ -999,6 +1105,12 @@ onMounted(async () => {
   window.addEventListener('resize', handleResize)
   window.addEventListener('keydown', handleGlobalPasteKeydown, true)
   window.addEventListener('paste', handlePaste, true)
+  // window.resize 收不到"窗口没变、但布局变了"的情况（字体加载、滚动条出现等），
+  // 而那同样会让网格尺寸和 tmux 对不上。
+  if (window.ResizeObserver && termContainer.value) {
+    viewportObserver = new ResizeObserver(handleResize)
+    viewportObserver.observe(termContainer.value)
+  }
   sessionRefreshTimer = setInterval(loadSessions, SESSION_REFRESH_MS)
   if (activeSession.value) {
     await nextTick()
@@ -1012,21 +1124,15 @@ onBeforeUnmount(() => {
   window.removeEventListener('paste', handlePaste, true)
   clearPendingShortcutPaste()
   clearInterval(sessionRefreshTimer)
-  Object.values(writeFrameIds).forEach(id => cancelAnimationFrame(id))
+  clearTimeout(globalResizeTimer)
+  viewportObserver?.disconnect()
+  Object.keys(termInstances).forEach(id => { deadSessions[id] = true })
+  Object.keys(reconnectTimers).forEach(clearReconnect)
   Object.values(wsConnections).forEach(ws => ws.close())
   Object.values(termInstances).forEach(t => t.dispose())
 })
 
-watch(activeSession, async (newVal) => {
-  if (newVal) {
-    await nextTick()
-    if (!termInstances[newVal]) await initTerminal(newVal)
-    else setTimeout(() => {
-      fitTerminal(newVal)
-      termInstances[newVal]?.focus()
-    }, 20)
-  }
-})
+watch(activeSession, (newVal) => activateSession(newVal))
 </script>
 
 <style scoped>

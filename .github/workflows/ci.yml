@@ -1,0 +1,78 @@
+name: CI
+
+# 项目此前没有任何自动化验证：没有测试、没有 CI、没有 lint 配置，
+# 唯一的闸门是 build_fpk.sh 里的 cargo build --release。
+# 对一个以 root 运行、通过 HTTP 分发交互式 shell 的服务，这是最大的过程缺口。
+# 这里先把最便宜、收益最高的三件事守住：fmt、clippy、两端都能构建。
+
+on:
+  push:
+    branches: [fnos, ubuntu]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  backend:
+    name: backend (fmt + clippy + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      # clippy 的 never_loop / let_underscore_future 等是 deny-by-default，
+      # 曾经在 upload_background 和剪贴板上传上各埋了一个真 bug。
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --release
+
+  frontend:
+    name: frontend (build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run build
+
+  scripts:
+    name: packaging scripts (shell syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # FPK 生命周期钩子跑在安装/升级/卸载路径上，语法错了要等装机才发现。
+      - name: bash -n
+        run: |
+          for f in build_fpk.sh install_fpk.sh build_fpk/cmd/*; do
+            [ -f "$f" ] || continue
+            echo "checking $f"
+            bash -n "$f"
+          done

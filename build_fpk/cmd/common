@@ -130,11 +130,15 @@ clean_temp_files ()
     
     rm -f "${TRIM_PKGVAR}/rmux.log"
     rm -f "${TRIM_PKGVAR}/rmux.pid"
-    rm -f "${TRIM_PKGVAR}/rmux_jwt_secret_v2"
+    # 注意：JWT 密钥不能在升级时删。删了会重新生成，所有已签发的 token
+    # （有效期 30 天）当场失效，而前端没有 401 拦截器，表现是升级后接口
+    # 静默报错而不是跳回登录页。要重置密钥请走卸载流程 (clean_all_data)。
     rm -rf "${TRIM_PKGVAR}/sessions"
     rm -rf "${TRIM_PKGVAR}/logs"
+    # outputs/ 是旧版 pipe-pane 抓屏留下的目录，新架构不再产生；
+    # 这里保留删除动作，好让老装机上残留的 .out 文件被清掉。
     rm -rf "${TRIM_PKGVAR}/outputs"
-    
+
     install_log "临时文件清理完成"
 }
 
@@ -208,11 +212,9 @@ install_callback ()
     # 创建必要的子目录
     $MKDIR "${TRIM_PKGVAR}/sessions"
     $MKDIR "${TRIM_PKGVAR}/logs"
-    $MKDIR "${TRIM_PKGVAR}/outputs"
     $MKDIR "${TRIM_PKGVAR}/backgrounds"
-    
+
     # 确保权限
-    chmod 777 "${TRIM_PKGVAR}/outputs"
     chmod 777 "${TRIM_PKGVAR}/backgrounds"
     
     install_log "安装完成，环境已就绪"
@@ -279,7 +281,6 @@ upgrade_callback ()
     # 重建目录结构
     $MKDIR "${TRIM_PKGVAR}/sessions"
     $MKDIR "${TRIM_PKGVAR}/logs"
-    $MKDIR "${TRIM_PKGVAR}/outputs"
     $MKDIR "${TRIM_PKGVAR}/backgrounds"
     
     install_log "升级完成，服务已重启"

@@ -6,7 +6,7 @@ description = "Rmux - Web terminal with SSH/tmux"
 
 [dependencies]
 # Web framework
-axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
@@ -22,22 +22,19 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 
-# Auth
+# Auth（口令用 bcrypt；此前还声明了 argon2，但代码里从未调用，反而让人误以为
+# KDF 是 argon2）
 jsonwebtoken = "9"
-argon2 = "0.5"
+bcrypt = "0.19.1"
 uuid = { version = "1", features = ["v4"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
-# Async
-futures-util = "0.3"
-tokio-util = "0.7"
-
 # HTTP client (for background URL download)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
-notify = "8.2.0"
 libc = "0.2.186"
-bcrypt = "0.19.1"
-async-trait = "0.1.89"
+
+# PTY (tmux attach client)
+portable-pty = "0.9"

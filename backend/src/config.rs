@@ -11,7 +11,6 @@ pub struct AppConfig {
     pub skip_auth_file: PathBuf,
     pub session_file: PathBuf,
     pub backgrounds_dir: PathBuf,
-    pub outputs_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub ui_dir: PathBuf,
@@ -46,7 +45,6 @@ impl AppConfig {
             skip_auth_file: data_dir.join(".skip_auth"),
             session_file: data_dir.join("rmux_sessions.json"),
             backgrounds_dir: data_dir.join("backgrounds"),
-            outputs_dir: data_dir.join("outputs"),
             logs_dir: data_dir.join("logs"),
             sessions_dir: data_dir.join("sessions"),
             ui_dir: PathBuf::from(&app_dest).join("www"),
@@ -107,15 +105,6 @@ impl AppConfig {
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.backgrounds_dir)?;
-
-        std::fs::create_dir_all(&self.outputs_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&self.outputs_dir, std::fs::Permissions::from_mode(0o777));
-        }
-
         std::fs::create_dir_all(&self.logs_dir)?;
         std::fs::create_dir_all(&self.sessions_dir)?;
 

@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Multipart, Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Multipart, Path, State, WebSocketUpgrade,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -9,8 +9,8 @@ use axum::{
     Json, Router,
 };
 use serde_json::Value;
+use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tracing::{info, warn};
 
 use crate::auth::*;
@@ -19,6 +19,10 @@ use crate::db::DbPool;
 use crate::models::*;
 use crate::terminal;
 
+/// 上传上限。axum 默认只有 2MiB，截图很容易超过而被静默拒绝；
+/// 同时也不能不设上限，否则任何已鉴权调用方都能把数据盘写满。
+const UPLOAD_SIZE_LIMIT: usize = 16 * 1024 * 1024;
+
 // ─── App State ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -26,10 +30,8 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub db: DbPool,
     pub sessions: terminal::SessionRegistry,
+    pub attaches: terminal::AttachRegistry,
 }
-
-const INPUT_SNAPSHOT_DELAY_MS: u64 = 15;
-const ENTER_SNAPSHOT_DELAY_MS: u64 = 80;
 
 // ─── Router ─────────────────────────────────────────────────────────────
 
@@ -59,7 +61,10 @@ fn api_routes() -> Router<AppState> {
         // Terminal WebSocket
         .route("/ws/terminal/{session_id}", get(terminal_resume_ws))
         // Clipboard Bridge
-        .route("/api/terminal/clipboard", post(update_clipboard))
+        .route(
+            "/api/terminal/clipboard",
+            post(update_clipboard).layer(DefaultBodyLimit::max(UPLOAD_SIZE_LIMIT)),
+        )
         // Clipboard History (global per-user, persisted in SQLite)
         .route("/api/clipboard", get(list_clipboard))
         .route("/api/clipboard", post(record_clipboard))
@@ -68,7 +73,10 @@ fn api_routes() -> Router<AppState> {
         .route("/api/theme", get(get_theme))
         .route("/api/theme", post(save_theme))
         .route("/api/theme/reset", post(reset_theme))
-        .route("/api/theme/background", post(upload_background))
+        .route(
+            "/api/theme/background",
+            post(upload_background).layer(DefaultBodyLimit::max(UPLOAD_SIZE_LIMIT)),
+        )
         .route("/api/theme/background/{filename}", get(get_background_file))
         .route("/api/theme/background-url", post(save_background_url))
         // System
@@ -186,6 +194,16 @@ async fn get_me(parts: axum::http::request::Parts) -> Json<ApiResponse<AuthUser>
 
 // ─── Session Handlers ───────────────────────────────────────────────────
 
+/// 把会话注册表落盘。create / rename / delete 以及会话确认消失时调用。
+///
+/// resize 不落盘：尺寸在每次连接建立时都会被前端重新上报（首帧 resize 是
+/// 协议约定），存的是旧值也无害，不值得为此每秒写盘。
+///
+/// 注意：内部会取读锁，调用前必须先放掉写锁，否则自锁。
+async fn persist_sessions(state: &AppState) {
+    terminal::persist_sessions(&state.config, &state.sessions).await;
+}
+
 async fn list_sessions(
     State(state): State<AppState>,
     auth: AuthUserExtractor,
@@ -229,7 +247,7 @@ async fn create_session(
     let session =
         terminal::create_local_session(&state.config, &session_id, &auth.0, req.cols, req.rows)
             .await
-            .map_err(|e| ApiError::new(e))?;
+            .map_err(ApiError::new)?;
 
     let info = SessionInfo {
         session_id: session.session_id.clone(),
@@ -244,8 +262,12 @@ async fn create_session(
         cwd: session.cwd.clone(),
     };
 
-    let mut sessions = state.sessions.write().await;
-    sessions.insert(session.session_id.clone(), session);
+    state
+        .sessions
+        .write()
+        .await
+        .insert(session.session_id.clone(), session);
+    persist_sessions(&state).await;
     Ok(Json(ApiResponse::ok(info)))
 }
 
@@ -298,31 +320,35 @@ async fn update_session_name(
         return Err(ApiError::new("名称不能超过32个字符"));
     }
 
-    let mut sessions = state.sessions.write().await;
-    let session = sessions
-        .get_mut(&session_id)
-        .ok_or_else(|| ApiError::new("会话不存在"))?;
+    // 写锁只在这个块里活着 —— persist_sessions 会取读锁，带着写锁调用会自锁。
+    let info = {
+        let mut sessions = state.sessions.write().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| ApiError::not_found("会话不存在"))?;
 
-    if session.owner_uid != auth.0.uid {
-        return Err(ApiError::new("无权修改"));
-    }
+        if session.owner_uid != auth.0.uid {
+            return Err(ApiError::forbidden("无权修改"));
+        }
 
-    session.name = name.to_string();
-    session.last_activity = chrono::Utc::now().to_rfc3339();
+        session.name = name.to_string();
+        session.last_activity = chrono::Utc::now().to_rfc3339();
 
-    let info = SessionInfo {
-        session_id: session.session_id.clone(),
-        name: session.name.clone(),
-        owner_uid: session.owner_uid,
-        owner_user: session.owner_user.clone(),
-        session_type: session.session_type.clone(),
-        status: "active".into(),
-        created_at: session.created_at.clone(),
-        last_activity: session.last_activity.clone(),
-        size: session.size.clone(),
-        cwd: session.cwd.clone(),
+        SessionInfo {
+            session_id: session.session_id.clone(),
+            name: session.name.clone(),
+            owner_uid: session.owner_uid,
+            owner_user: session.owner_user.clone(),
+            session_type: session.session_type.clone(),
+            status: "active".into(),
+            created_at: session.created_at.clone(),
+            last_activity: session.last_activity.clone(),
+            size: session.size.clone(),
+            cwd: session.cwd.clone(),
+        }
     };
 
+    persist_sessions(&state).await;
     Ok(Json(ApiResponse::ok(info)))
 }
 
@@ -331,26 +357,38 @@ async fn delete_session(
     Path(session_id): Path<String>,
     auth: AuthUserExtractor,
 ) -> Json<ApiResponse<Value>> {
-    let mut sessions = state.sessions.write().await;
-    if let Some(s) = sessions.get(&session_id) {
-        if s.owner_uid != auth.0.uid {
-            return Json(ApiResponse {
-                success: false,
-                message: "无权删除".into(),
-                data: None,
-            });
+    // 先在锁内完成校验和摘除，再放锁去做 tmux 子进程调用。
+    // 原来是把写锁一直持到 kill_tmux_session().await 之后 —— 关一个标签页
+    // 就会把其他所有注册表访问（含新的 WS attach）堵在一次子进程往返后面。
+    let removed = {
+        let mut sessions = state.sessions.write().await;
+        match sessions.get(&session_id) {
+            Some(s) if s.owner_uid != auth.0.uid => {
+                return Json(ApiResponse {
+                    success: false,
+                    message: "无权删除".into(),
+                    data: None,
+                });
+            }
+            Some(_) => sessions.remove(&session_id),
+            None => None,
         }
-    }
-    if let Some(s) = sessions.remove(&session_id) {
-        let _ = terminal::kill_tmux_session(&state.config, &session_id, &s.tmux_session_name, true)
-            .await;
-        Json(ApiResponse::ok(serde_json::json!({})))
-    } else {
-        Json(ApiResponse {
+    };
+
+    match removed {
+        Some(s) => {
+            let _ =
+                terminal::kill_tmux_session(&state.config, &session_id, &s.tmux_session_name, true)
+                    .await;
+            terminal::release_attach(&state.attaches, &session_id).await;
+            persist_sessions(&state).await;
+            Json(ApiResponse::ok(serde_json::json!({})))
+        }
+        None => Json(ApiResponse {
             success: false,
             message: "不存在".into(),
             data: None,
-        })
+        }),
     }
 }
 
@@ -365,131 +403,196 @@ async fn terminal_resume_ws(
     ws.on_upgrade(move |socket| handle_terminal_resume(state, socket, session_id, auth))
 }
 
+/// 前端连上后多久还没报告尺寸就按记录值开工，避免连接卡死。
+const INITIAL_SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3000);
+/// 空闲连接会被反向代理按读超时掐断，而两端都不会收到通知：终端看着还在，
+/// 输出却永远不再送达。定期 Ping 既保活也能尽早发现死连接。
+const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// tmux 一 attach 就会按当前 PTY 尺寸整屏重绘。若此时浏览器还没报告真实尺寸，
+/// 这一屏就画在错误的网格上，而之后 tmux 只发增量更新 —— 基线错了就再也回不来，
+/// 残影、上下叠帧、光标错位全部由此而来。所以先收第一条 resize 再 attach。
+///
+/// 这期间到达的按键先攒着，attach 之后原样补发，避免丢输入。
+async fn await_initial_size(
+    ws: &mut WebSocket,
+    fallback: &TermSize,
+    pending_input: &mut Vec<Vec<u8>>,
+) -> Option<TermSize> {
+    let deadline = tokio::time::Instant::now() + INITIAL_SIZE_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.recv()).await {
+            // 前端没按约定报尺寸（老版本页面），退回记录值继续。
+            Err(_) => return Some(fallback.clone()),
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return None,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                match serde_json::from_str::<TerminalMessage>(&text) {
+                    Ok(TerminalMessage::Resize { cols, rows }) => {
+                        return Some(TermSize { cols, rows })
+                    }
+                    Ok(TerminalMessage::Input { data }) => pending_input.push(data.into_bytes()),
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(Message::Binary(bytes)))) => pending_input.push(bytes.to_vec()),
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
 async fn handle_terminal_resume(
     state: AppState,
     mut ws: WebSocket,
-    session_id_param: String,
-    _auth: AuthUserExtractor,
+    session_id: String,
+    auth: AuthUserExtractor,
 ) {
-    let (tmux_name, output_file, is_new) = {
+    let (tmux_name, owner, stored_size) = {
         let sessions = state.sessions.read().await;
-        if let Some(s) = sessions.get(&session_id_param) {
-            (s.tmux_session_name.clone(), s.output_file.clone(), s.is_new)
-        } else {
-            let _ = ws.send(Message::Text("SESSION_NOT_FOUND".into())).await;
+        match sessions.get(&session_id) {
+            // 归属校验：owner 直接决定 attach 时 runuser/su 切到哪个账户，
+            // 服务又以 root 运行，漏掉这一步等于任何通过鉴权的调用方
+            // 只要猜到 session_id 就能拿到该账户的交互式 shell。
+            // 越权时回 SESSION_NOT_FOUND 而不是"无权"，避免探测会话是否存在。
+            Some(s) if s.owner_uid != auth.0.uid => {
+                warn!(
+                    "拒绝越权 attach: session={} owner_uid={} requester_uid={}",
+                    session_id, s.owner_uid, auth.0.uid
+                );
+                let _ = ws.send(Message::Text("SESSION_NOT_FOUND".into())).await;
+                return;
+            }
+            Some(s) => (
+                s.tmux_session_name.clone(),
+                AuthUser {
+                    uid: s.owner_uid,
+                    user: s.owner_user.clone(),
+                    is_admin: true,
+                    groups: vec!["Users".into()],
+                },
+                s.size.clone(),
+            ),
+            None => {
+                let _ = ws.send(Message::Text("SESSION_NOT_FOUND".into())).await;
+                return;
+            }
+        }
+    };
+
+    let mut pending_input = Vec::new();
+    let Some(size) = await_initial_size(&mut ws, &stored_size, &mut pending_input).await else {
+        return;
+    };
+
+    // 登记要放在 attach 之前：attach 带 `-d`，会顶掉上一个客户端，
+    // 上一个必须先收到"被接管"的通知，才不会转头又重连回来。
+    let mut replaced = terminal::claim_attach(&state.attaches, &session_id).await;
+
+    let terminal::PtyIo {
+        mut output,
+        control,
+    } = match terminal::attach_pty_session(
+        &state.config,
+        &session_id,
+        &tmux_name,
+        &owner,
+        clamp_axis(size.cols),
+        clamp_axis(size.rows),
+    ) {
+        Ok(io) => io,
+        Err(e) => {
+            warn!("attach 终端失败: {}", e);
+            // claim 已经把上一个客户端踢下线了，而我们自己又没接上。
+            // 不回滚的话：上一个窗口永久停在"已在其它窗口打开"，这个窗口停在
+            // SESSION_GONE，而 tmux 会话其实一直好好活着，只能整页刷新才能救回来。
+            terminal::release_attach(&state.attaches, &session_id).await;
+            let _ = ws.send(Message::Text("SESSION_GONE".into())).await;
             return;
         }
     };
 
-    if is_new {
-        let mut sessions = state.sessions.write().await;
-        if let Some(s) = sessions.get_mut(&session_id_param) {
-            s.is_new = false;
+    if let Some(s) = state.sessions.write().await.get_mut(&session_id) {
+        s.size = size;
+        s.last_activity = chrono::Utc::now().to_rfc3339();
+    }
+
+    for data in pending_input {
+        if !control.write_input(data) {
+            return;
         }
     }
 
-    let config_clone = state.config.clone();
-    let session_id_param_clone = session_id_param.clone();
-    let tmux_name_clone = tmux_name.clone();
-    let mut history_sent = false;
+    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await; // interval 的第一拍是立即触发的，丢掉。
 
-    const MAX_OUTPUT_DELTA_BYTES: u64 = 256 * 1024;
-    const OUTPUT_POLL_INTERVAL_MS: u64 = 30;
-
-    let mut output_file_handle = match tokio::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(&output_file)
-        .await
-    {
-        Ok(file) => Some(file),
-        Err(e) => {
-            warn!("打开输出文件失败: {}", e);
-            None
-        }
-    };
-    let mut last_output_size = if let Some(file) = output_file_handle.as_mut() {
-        file.metadata().await.map(|m| m.len()).unwrap_or(0)
-    } else {
-        0
-    };
-    let mut output_poll =
-        tokio::time::interval(tokio::time::Duration::from_millis(OUTPUT_POLL_INTERVAL_MS));
-
-    'connection: loop {
+    loop {
         tokio::select! {
-            _ = output_poll.tick() => {
-                let Some(file) = output_file_handle.as_mut() else {
-                    continue;
-                };
-
-                if let Ok(meta) = file.metadata().await {
-                    let len = meta.len();
-                    if len < last_output_size {
-                        last_output_size = 0;
-                        let _ = file.seek(SeekFrom::Start(0)).await;
-                    }
-
-                    while len > last_output_size {
-                        let read_len = std::cmp::min(len - last_output_size, MAX_OUTPUT_DELTA_BYTES);
-                        let mut buffer = vec![0; read_len as usize];
-                        let _ = file.seek(SeekFrom::Start(last_output_size)).await;
-                        if file.read_exact(&mut buffer).await.is_err() {
+            _ = ping.tick() => {
+                if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+            // changed() 出错说明发送端没了 —— 那是会话被删除，不是被接管，
+            // 此时不能报 SESSION_REPLACED，否则用户主动关标签也会看到"已在其它窗口打开"。
+            outcome = replaced.changed() => {
+                if outcome.is_ok() {
+                    let _ = ws.send(Message::Text("SESSION_REPLACED".into())).await;
+                }
+                break;
+            }
+            chunk = output.recv() => {
+                match chunk {
+                    // tmux 生成的字节原样转发。必须走二进制帧：按 UTF-8 解码会在
+                    // 分块边界切断多字节字符，中文和框线字符会碎成 U+FFFD。
+                    Some(bytes) => {
+                        if ws.send(Message::Binary(bytes.into())).await.is_err() {
                             break;
                         }
-
-                        let delta = String::from_utf8_lossy(&buffer).to_string();
-                        last_output_size += read_len;
-                        if ws.send(Message::Text(delta.into())).await.is_err() {
-                            break 'connection;
+                    }
+                    None => {
+                        // PTY 读到 EOF：tmux 客户端退出了。可能是会话真的结束，
+                        // 也可能只是被同会话的新客户端顶掉，两者要区别对待。
+                        if !terminal::check_tmux_session(&state.config, &session_id, &tmux_name).await {
+                            state.sessions.write().await.remove(&session_id);
+                            terminal::release_attach(&state.attaches, &session_id).await;
+                            persist_sessions(&state).await;
+                            let _ = ws.send(Message::Text("SESSION_GONE".into())).await;
                         }
+                        break;
                     }
                 }
             }
             msg = ws.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<TerminalMessage>(&text) {
-                            match cmd {
-                                TerminalMessage::Input { data } => {
-                                    let _ = terminal::write_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
-                                    if let Some(delay_ms) = input_snapshot_delay_ms(&data) {
-                                        let submitted = is_submit_input(&data);
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone, submitted).await {
-                                            if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
-                                                break;
-                                            }
-                                            skip_captured_output(&mut output_file_handle, &mut last_output_size).await;
-                                        }
-                                    }
+                        let Ok(cmd) = serde_json::from_str::<TerminalMessage>(&text) else {
+                            continue;
+                        };
+                        match cmd {
+                            TerminalMessage::Input { data } => {
+                                if !control.write_input(data.into_bytes()) {
+                                    break;
                                 }
-                                TerminalMessage::Paste { data } => {
-                                    let _ = terminal::paste_to_tmux(&state.config, &session_id_param, &tmux_name, &data).await;
-                                    if let Some(delay_ms) = input_snapshot_delay_ms(&data) {
-                                        let submitted = is_submit_input(&data);
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                                        if terminal::should_snapshot_after_input(&config_clone, &session_id_param_clone, &tmux_name_clone, submitted).await {
-                                            if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
-                                                break;
-                                            }
-                                            skip_captured_output(&mut output_file_handle, &mut last_output_size).await;
-                                        }
-                                    }
-                                }
-                                TerminalMessage::Resize { cols, rows } => {
-                                    let _ = terminal::resize_tmux(&state.config, &session_id_param, &tmux_name, cols, rows).await;
-                                    if !history_sent {
-                                        if !send_terminal_snapshot(&mut ws, &config_clone, &session_id_param_clone, &tmux_name_clone, 500).await {
-                                            break;
-                                        }
-                                        history_sent = true;
-                                    }
-                                }
-                                TerminalMessage::CloseTerminal => break,
-                                _ => {}
                             }
+                            TerminalMessage::Paste { data } => {
+                                if let Err(e) = terminal::paste_to_tmux(&state.config, &session_id, &tmux_name, &data).await {
+                                    warn!("粘贴失败: {}", e);
+                                }
+                            }
+                            TerminalMessage::Resize { cols, rows } => {
+                                control.resize(clamp_axis(cols), clamp_axis(rows));
+                                if let Some(s) = state.sessions.write().await.get_mut(&session_id) {
+                                    s.size = TermSize { cols, rows };
+                                    s.last_activity = chrono::Utc::now().to_rfc3339();
+                                }
+                            }
+                            TerminalMessage::CloseTerminal => break,
+                            TerminalMessage::ResumeSession { .. } | TerminalMessage::KeepAlive => {}
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if !control.write_input(bytes.to_vec()) {
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -501,51 +604,9 @@ async fn handle_terminal_resume(
     }
 }
 
-fn input_snapshot_delay_ms(data: &str) -> Option<u64> {
-    if data.is_empty() {
-        None
-    } else if is_submit_input(data) {
-        Some(ENTER_SNAPSHOT_DELAY_MS)
-    } else {
-        Some(INPUT_SNAPSHOT_DELAY_MS)
-    }
-}
-
-fn is_submit_input(data: &str) -> bool {
-    data.contains('\n') || data.contains('\r')
-}
-
-async fn skip_captured_output(
-    output_file_handle: &mut Option<tokio::fs::File>,
-    last_output_size: &mut u64,
-) {
-    let Some(file) = output_file_handle.as_mut() else {
-        return;
-    };
-
-    if let Ok(meta) = file.metadata().await {
-        *last_output_size = meta.len();
-        let _ = file.seek(SeekFrom::Start(*last_output_size)).await;
-    }
-}
-
-async fn send_terminal_snapshot(
-    ws: &mut WebSocket,
-    config: &AppConfig,
-    session_id: &str,
-    tmux_name: &str,
-    lines: u32,
-) -> bool {
-    match terminal::capture_tmux_snapshot(config, session_id, tmux_name, lines).await {
-        Ok(history) => ws
-            .send(Message::Text(format!("\x1b[2J\x1b[H{}", history).into()))
-            .await
-            .is_ok(),
-        Err(e) => {
-            warn!("同步终端画面失败: {}", e);
-            true
-        }
-    }
+/// tmux 对异常尺寸容错很差，钳到可用范围再传下去。
+fn clamp_axis(value: u32) -> u16 {
+    value.clamp(1, 1000) as u16
 }
 
 // ─── Clipboard & Theme & System Handlers ────────────────────────────────
@@ -574,7 +635,11 @@ async fn update_clipboard(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+            // 必须用阻塞版：tokio::fs::set_permissions 返回 Future，
+            // `let _ =` 会把它直接丢弃，权限根本不会被改。文件由 root 写入，
+            // umask 077 时会落成 0600，被 runuser 切过去的用户 shell 读不到
+            // 刚刚粘贴进来的图片 —— 招牌功能静默失效。
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
         }
         files.push(serde_json::json!({
             "field": field_name,
@@ -700,22 +765,20 @@ async fn list_clipboard(
         .map_err(|e| ApiError::new(e.to_string()))?;
 
     let mut items: Vec<ClipboardItem> = Vec::new();
-    for row in rows {
-        if let Ok(item) = row {
-            // 过滤掉本地文件已被清理的图片项，避免点击后粘贴一个失效路径
-            if item.kind == "image" {
-                if let Some(p) = item.path.as_deref() {
-                    if !std::path::Path::new(p).exists() {
-                        let _ = conn.execute(
-                            "DELETE FROM clipboard_history WHERE id=?1",
-                            rusqlite::params![item.id],
-                        );
-                        continue;
-                    }
+    for item in rows.flatten() {
+        // 过滤掉本地文件已被清理的图片项，避免点击后粘贴一个失效路径
+        if item.kind == "image" {
+            if let Some(p) = item.path.as_deref() {
+                if !std::path::Path::new(p).exists() {
+                    let _ = conn.execute(
+                        "DELETE FROM clipboard_history WHERE id=?1",
+                        rusqlite::params![item.id],
+                    );
+                    continue;
                 }
             }
-            items.push(item);
         }
+        items.push(item);
     }
     Ok(Json(ApiResponse::ok(items)))
 }
@@ -812,12 +875,22 @@ async fn clear_clipboard(
     Ok(Json(ApiResponse::ok(serde_json::json!({}))))
 }
 
+/// 主题默认值。`ThemeSettings` 已按 camelCase 序列化，与命中分支同构。
+fn theme_defaults_json() -> Value {
+    serde_json::to_value(ThemeSettings::default()).unwrap_or_else(|_| serde_json::json!({}))
+}
+
 async fn get_theme(
     State(state): State<AppState>,
     auth: AuthUserExtractor,
-) -> Json<ApiResponse<Value>> {
-    let conn = state.db.get().unwrap();
-    let mut stmt = conn.prepare("SELECT theme, font_size, background_opacity, background_image, background_image_type, saved_url_image, saved_upload_image, tab_style, cursor_style, component_customization FROM theme_settings WHERE owner_uid=?1 AND is_active=1 ORDER BY id DESC LIMIT 1").unwrap();
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    // 这里原来对 pool.get() 和 prepare() 双 unwrap —— 全库唯一一个能把
+    // 活跃请求 panic 掉的 handler（连接池耗尽即触发）。
+    let conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut stmt = conn.prepare("SELECT theme, font_size, background_opacity, background_image, background_image_type, saved_url_image, saved_upload_image, tab_style, cursor_style, component_customization FROM theme_settings WHERE owner_uid=?1 AND is_active=1 ORDER BY id DESC LIMIT 1").map_err(|e| ApiError::internal(e.to_string()))?;
     let result = stmt.query_row([auth.0.uid], |row| {
         Ok(serde_json::json!({
             "theme": row.get::<_, String>(0)?, "fontSize": row.get::<_, i64>(1)?, "backgroundOpacity": row.get::<_, i64>(2)?,
@@ -827,10 +900,8 @@ async fn get_theme(
         }))
     });
     match result {
-        Ok(settings) => Json(ApiResponse::ok(settings)),
-        Err(_) => Json(ApiResponse::ok(
-            serde_json::to_value(ThemeSettings::default()).unwrap(),
-        )),
+        Ok(settings) => Ok(Json(ApiResponse::ok(settings))),
+        Err(_) => Ok(Json(ApiResponse::ok(theme_defaults_json()))),
     }
 }
 
@@ -839,10 +910,15 @@ async fn save_theme(
     auth: AuthUserExtractor,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, ApiError> {
-    let conn = state.db.get().map_err(|e| ApiError::new(e.to_string()))?;
+    let conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // 原先只是把旧行置 is_active=0 再插新行，而查询只看 is_active=1 —— 旧行
+    // 永远读不到却永远留着，表随保存次数无界增长。直接删掉等价且有界。
     conn.execute(
-        "UPDATE theme_settings SET is_active=0 WHERE owner_uid=?1",
+        "DELETE FROM theme_settings WHERE owner_uid=?1",
         [auth.0.uid],
     )
     .ok();
@@ -855,15 +931,16 @@ async fn reset_theme(
     State(state): State<AppState>,
     auth: AuthUserExtractor,
 ) -> Result<Json<ApiResponse<Value>>, ApiError> {
-    let conn = state.db.get().map_err(|e| ApiError::new(e.to_string()))?;
+    let conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     conn.execute(
         "DELETE FROM theme_settings WHERE owner_uid=?1",
         [auth.0.uid],
     )
     .ok();
-    Ok(Json(ApiResponse::ok(
-        serde_json::to_value(ThemeSettings::default()).unwrap(),
-    )))
+    Ok(Json(ApiResponse::ok(theme_defaults_json())))
 }
 
 async fn upload_background(
@@ -871,34 +948,143 @@ async fn upload_background(
     auth: AuthUserExtractor,
     mut multipart: Multipart,
 ) -> Result<Json<ApiResponse<Value>>, ApiError> {
-    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
-        let _name = field.file_name().unwrap_or("bg.png").to_string();
-        let data = field
-            .bytes()
-            .await
-            .map_err(|e| ApiError::new(e.to_string()))?;
-        let filename = format!("{}_{}.png", auth.0.uid, chrono::Utc::now().timestamp());
-        let path = state.config.backgrounds_dir.join(&filename);
-        tokio::fs::write(&path, &data)
-            .await
-            .map_err(|e| ApiError::new(e.to_string()))?;
-        return Ok(Json(ApiResponse::ok(
-            serde_json::json!({ "filename": filename }),
-        )));
+    // 只取第一个字段。原先写成 `while let`，循环体无条件 return，
+    // 触发 clippy 的 deny-by-default `never_loop`；语义本就是"取一个"。
+    let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?
+    else {
+        return Err(ApiError::new("未收到文件"));
+    };
+
+    let data = field
+        .bytes()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+    let filename = format!("{}_{}.png", auth.0.uid, chrono::Utc::now().timestamp());
+    let path = state.config.backgrounds_dir.join(&filename);
+    tokio::fs::write(&path, &data)
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        serde_json::json!({ "filename": filename }),
+    )))
+}
+
+/// 把路径参数收敛成 backgrounds 目录下的单个普通文件名。
+///
+/// axum 会对路径参数做百分号解码，因此 `%2e%2e%2f` 到达这里就是真正的 `../`；
+/// 直接 join 到目录上就是一个任意文件读原语。这里要求整个参数正好是一段
+/// Normal 组件：带分隔符、`..`、根前缀或空的一律拒绝。
+fn resolve_background_path(config: &AppConfig, filename: &str) -> Option<std::path::PathBuf> {
+    let mut components = std::path::Path::new(filename).components();
+    let name = match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => name,
+        _ => return None,
+    };
+    if name.to_str().map(|s| s.starts_with('.')).unwrap_or(true) {
+        return None;
     }
-    Err(ApiError::new("No file"))
+    Some(config.backgrounds_dir.join(name))
 }
 
 async fn get_background_file(
     State(state): State<AppState>,
+    _auth: AuthUserExtractor,
     Path(filename): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let path = state.config.backgrounds_dir.join(&filename);
-    if let Ok(data) = tokio::fs::read(&path).await {
-        Ok(([(header::CONTENT_TYPE, "image/png")], data).into_response())
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    let path = resolve_background_path(&state.config, &filename).ok_or(StatusCode::NOT_FOUND)?;
+    match tokio::fs::read(&path).await {
+        Ok(data) => Ok(([(header::CONTENT_TYPE, "image/png")], data).into_response()),
+        Err(_) => Err(StatusCode::NOT_FOUND),
     }
+}
+
+/// 背景图下载上限，同时也是 URL 下载的读取上限。
+const BACKGROUND_URL_LIMIT: usize = 16 * 1024 * 1024;
+
+/// 回环与链路本地地址一律拒绝：前者能打到本机上任何只监听 127.0.0.1 的服务
+/// （包括 Rmux 自己），后者覆盖 169.254.169.254 这类云元数据端点。
+///
+/// 私网段（192.168/10/172.16）不拦 —— NAS 本来就在局域网里，从同网段主机取
+/// 一张壁纸是正常用法，拦掉会误伤。
+fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 链路本地
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // ::ffff:127.0.0.1 之类的映射地址要按 IPv4 规则再判一次
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_blocked_ip(&IpAddr::V4(v4)))
+                    .unwrap_or(false)
+        }
+    }
+}
+
+async fn fetch_remote_image(url: &str) -> Result<Vec<u8>, ApiError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| ApiError::new("URL 格式无效"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::new("仅支持 http/https 链接"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::new("URL 缺少主机名"))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+
+    // 逐个检查解析结果：只看字面量会被"域名指向 127.0.0.1"直接绕过。
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| ApiError::new("无法解析该主机"))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(ApiError::new("无法解析该主机"));
+    }
+    if addrs.iter().any(|addr| is_blocked_ip(&addr.ip())) {
+        return Err(ApiError::forbidden("不允许访问该地址"));
+    }
+
+    let client = reqwest::Client::builder()
+        // 跳转会绕过上面刚做完的地址检查，直接禁掉。
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let mut resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ApiError::new(format!("下载失败: HTTP {}", resp.status())));
+    }
+
+    // Content-Length 是对方说了算的，边收边计数才是真的上限。
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?
+    {
+        if body.len() + chunk.len() > BACKGROUND_URL_LIMIT {
+            return Err(ApiError::new("图片超过 16MB 限制"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 async fn save_background_url(
@@ -909,23 +1095,18 @@ async fn save_background_url(
     let url = body
         .get("url")
         .and_then(|v| v.as_str())
-        .ok_or(ApiError::new("No url"))?;
-    let data = reqwest::get(url)
-        .await
-        .map_err(|e| ApiError::new(e.to_string()))?
-        .bytes()
-        .await
-        .map_err(|e| ApiError::new(e.to_string()))?;
+        .ok_or_else(|| ApiError::new("缺少 url"))?;
+    let data = fetch_remote_image(url).await?;
     let filename = format!("{}_{}_url.png", auth.0.uid, chrono::Utc::now().timestamp());
     tokio::fs::write(state.config.backgrounds_dir.join(&filename), &data)
         .await
-        .map_err(|e| ApiError::new(e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
         serde_json::json!({ "filename": filename }),
     )))
 }
 
-async fn get_system_info() -> Json<ApiResponse<Value>> {
+async fn get_system_info(_auth: AuthUserExtractor) -> Json<ApiResponse<Value>> {
     let hostname =
         std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_else(|_| "unknown".into());
     Json(ApiResponse::ok(
@@ -935,13 +1116,56 @@ async fn get_system_info() -> Json<ApiResponse<Value>> {
 
 async fn purge_data(
     State(state): State<AppState>,
-    _auth: AuthUserExtractor,
+    auth: AuthUserExtractor,
 ) -> Result<Json<ApiResponse<Value>>, ApiError> {
-    // 危险操作：清空所有用户数据 (logs, outputs, db 等)
-    // 注意：不删除正在使用的 tmux socket
-    let _ = std::fs::remove_dir_all(&state.config.outputs_dir);
+    // 危险操作：清空当前用户的数据 —— 背景图、主题、剪贴板历史及其图片文件，
+    // 外加全局的应用日志目录。
+    // 明确不做的事：不动 rmux.db 以外的凭据文件，不删正在使用的 tmux socket。
+    //
+    // 背景图按 `<uid>_` 前缀归属，只删自己的 —— 原先是整个目录 remove_dir_all，
+    // 任何一个已鉴权用户都能顺手抹掉其他人的背景图。
     let _ = std::fs::remove_dir_all(&state.config.logs_dir);
-    let _ = std::fs::remove_dir_all(&state.config.backgrounds_dir);
+
+    let prefix = format!("{}_", auth.0.uid);
+    if let Ok(entries) = std::fs::read_dir(&state.config.backgrounds_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with(&prefix))
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let image_paths = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path FROM clipboard_history
+                 WHERE owner_uid=?1 AND kind='image' AND path IS NOT NULL",
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![auth.0.uid], |row| row.get::<_, String>(0))
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    let _ = conn.execute(
+        "DELETE FROM clipboard_history WHERE owner_uid=?1",
+        rusqlite::params![auth.0.uid],
+    );
+    let _ = conn.execute(
+        "DELETE FROM theme_settings WHERE owner_uid=?1",
+        rusqlite::params![auth.0.uid],
+    );
+    remove_clipboard_image_files(&state, image_paths);
+
     let _ = state.config.ensure_dirs();
     Ok(Json(ApiResponse::ok(serde_json::json!({}))))
 }

@@ -69,9 +69,7 @@ pub struct TerminalSession {
     pub created_at: String,
     pub last_activity: String,
     pub size: TermSize,
-    pub is_new: bool,
     pub tmux_session_name: String,
-    pub output_file: std::path::PathBuf,
     pub cwd: String,
 }
 
@@ -121,7 +119,10 @@ pub struct RecordClipboardRequest {
 
 // ─── Theme ──────────────────────────────────────────────────────────────
 
+/// camelCase 与 `get_theme` 命中分支手写的 JSON 保持一致 —— 前端按 camelCase
+/// 取值，两条分支若用不同命名，新用户拿到的服务端默认值会全部落空。
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ThemeSettings {
     pub theme: String,
     pub font_size: u32,
@@ -175,24 +176,49 @@ impl<T: Serialize> ApiResponse<T> {
     }
 }
 
+fn default_error_status() -> u16 {
+    StatusCode::BAD_REQUEST.as_u16()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApiError {
     pub success: bool,
     pub message: String,
+    /// HTTP 状态码。不进入响应体，只决定响应头。
+    #[serde(skip, default = "default_error_status")]
+    pub status: u16,
 }
 
 impl ApiError {
     pub fn new(msg: impl Into<String>) -> Self {
+        Self::with_status(StatusCode::BAD_REQUEST, msg)
+    }
+
+    pub fn with_status(status: StatusCode, msg: impl Into<String>) -> Self {
         Self {
             success: false,
             message: msg.into(),
+            status: status.as_u16(),
         }
+    }
+
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self::with_status(StatusCode::FORBIDDEN, msg)
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::with_status(StatusCode::NOT_FOUND, msg)
+    }
+
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::with_status(StatusCode::INTERNAL_SERVER_ERROR, msg)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, Json(self)).into_response()
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_REQUEST);
+        (status, Json(self)).into_response()
     }
 }
 
