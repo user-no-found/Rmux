@@ -751,6 +751,45 @@ const clearReconnect = (id) => {
   }
 }
 
+/// 服务端已经确认 tmux session 消失时，立即移除对应标签和渲染实例。
+/// 旧逻辑只在终端里写一行“会话已结束”，标签仍停在 `no sessions` 画面上，
+/// 还要等下一轮列表轮询才可能消失；这里与主动关闭使用同一套本地清理顺序。
+const removeLocalSession = (id, { removeColor = false } = {}) => {
+  const closedIndex = sessions.value.findIndex(session => session.session_id === id)
+  const ws = wsConnections[id]
+  const term = termInstances[id]
+
+  deadSessions[id] = true
+  clearReconnect(id)
+  delete wsConnections[id]
+  delete termInstances[id]
+  delete fitAddons[id]
+  delete termRefs[id]
+  delete renameInputRefs[id]
+  delete lastSentSize[id]
+  delete reconnectAttempts[id]
+  delete attachedOnce[id]
+  sessions.value = sessions.value.filter(session => session.session_id !== id)
+  if (editingSession.value === id) {
+    editingSession.value = null
+    editingName.value = ''
+  }
+  if (activeSession.value === id) {
+    activeSession.value = sessions.value[Math.min(closedIndex, sessions.value.length - 1)]?.session_id || null
+  }
+  if (removeColor) {
+    delete sessionDotClasses[id]
+    saveSessionDotClasses()
+  }
+
+  // WebSocket / WebGL / xterm 的释放可能同步处理大量缓冲区，延后一轮让 Vue 先
+  // 完成标签切换和空状态重绘，避免关闭动作本身卡住界面。
+  setTimeout(() => {
+    try { ws?.close() } catch (e) {}
+    try { term?.dispose() } catch (e) {}
+  }, 0)
+}
+
 /// 连接断了不代表 tmux 会话没了 —— 反向代理的空闲超时、网络抖动都会断连，
 /// 而 tmux 侧一切照旧。不重连的话终端看着还在，输出却再也不来。
 const scheduleReconnect = (id) => {
@@ -770,6 +809,10 @@ const connectTerminal = (id) => {
 
   const token = sessionStorage.getItem('rmux_token') || ''
   const ws = new WebSocket(`${WS_BASE}/ws/terminal/${id}?token=${encodeURIComponent(token)}`)
+  // 重连时等服务端发来这次连接的第一帧再清空旧画面。服务端的第一帧是
+  // 持久化历史快照（若没有历史则是 attach 的当前屏幕），这样不会让后续
+  // 的历史回放被 reset 清掉，也不会把旧连接的残影和新屏幕叠在一起。
+  let clearBeforeFirstFrame = Boolean(attachedOnce[id])
   // 终端输出是任意字节流。按文本收会在分块边界切断多字节 UTF-8，
   // 中文和框线字符会碎掉；交给 xterm.js 自己跨块解码才是正确的。
   ws.binaryType = 'arraybuffer'
@@ -780,9 +823,6 @@ const connectTerminal = (id) => {
   ws.onopen = () => {
     if (!isCurrent()) return
     reconnectAttempts[id] = 0
-    // 重连 = tmux 重新 attach = 又一次整屏重绘。屏上的旧帧不清掉，
-    // 新旧两帧就会叠在一起，这正是"同时出现两个显示"的来源。
-    if (attachedOnce[id]) term.reset()
     attachedOnce[id] = true
     // 置空让下面这次上报必定发出：新连接的后端一无所知，去重表得先清。
     lastSentSize[id] = null
@@ -796,9 +836,8 @@ const connectTerminal = (id) => {
     // 文本帧只用于控制消息，终端数据一律是二进制帧。
     if (typeof e.data === 'string') {
       if (e.data === 'SESSION_NOT_FOUND' || e.data === 'SESSION_GONE') {
-        deadSessions[id] = true
-        clearReconnect(id)
-        term.write('\r\n\x1b[31m[会话已结束]\x1b[0m')
+        removeLocalSession(id, { removeColor: true })
+        showToast('会话已结束')
       } else if (e.data === 'SESSION_REPLACED') {
         // 会话被另一个窗口接管了。这里必须停止重连，否则两个窗口会互相顶。
         // 重新点一下本标签可以再抢回来（reviveSession）。
@@ -808,6 +847,14 @@ const connectTerminal = (id) => {
       }
       return
     }
+    if (clearBeforeFirstFrame) {
+      clearBeforeFirstFrame = false
+      // clear 只清理当前 xterm buffer，不重置解析器/模式状态；随后服务端
+      // 的历史快照会正常进入新的 scrollback。reset() 会直接丢弃整个缓冲区，
+      // 在历史帧异步排队时容易造成“刷新后只能看到当前屏幕”。
+      term.clear()
+      term.clearSelection()
+    }
     term.write(new Uint8Array(e.data))
   }
 
@@ -815,7 +862,7 @@ const connectTerminal = (id) => {
     if (!isCurrent()) return
     delete wsConnections[id]
     if (deadSessions[id] || !termInstances[id]) return
-    // 只在断开这一刻提示一次；重连成功会 reset 掉，不会积一屏。
+    // 只在断开这一刻提示一次；重连首帧到达时会清理旧画面，不会积一屏。
     if (!reconnectAttempts[id]) {
       term.write('\r\n\x1b[33m[连接已断开，正在重连…]\x1b[0m')
     }
@@ -854,7 +901,7 @@ const initTerminal = async (id) => {
     fontSize: 14,
     fontFamily: 'Menlo, Monaco, "Courier New", monospace',
     lineHeight: 1.35,
-    scrollback: 2000,
+    scrollback: 5000,
     allowProposedApi: true,
     convertEol: false,
     // 主题背景是透明的，要让 WebGL 渲染器保留 alpha 必须显式打开，
@@ -995,33 +1042,7 @@ const closeSession = async (id) => {
   if (closingSessions.has(id)) return
   closingSessions.add(id)
 
-  const closedIndex = sessions.value.findIndex(session => session.session_id === id)
-  const ws = wsConnections[id]
-  const term = termInstances[id]
-
-  // 先更新渲染状态并摘掉连接引用。WebSocket / WebGL / xterm 的 dispose 可能
-  // 同步释放大量缓冲区，放到下一轮事件循环，避免它挡住当前点击的标签重绘。
-  // dead 标记必须先设，否则稍后 close 触发的 onclose 会把连接重新拉起来。
-  deadSessions[id] = true
-  clearReconnect(id)
-  delete wsConnections[id]
-  delete termInstances[id]
-  delete fitAddons[id]
-  delete termRefs[id]
-  delete renameInputRefs[id]
-  delete lastSentSize[id]
-  delete reconnectAttempts[id]
-  delete attachedOnce[id]
-  sessions.value = sessions.value.filter(session => session.session_id !== id)
-  if (editingSession.value === id) cancelRename()
-  if (activeSession.value === id) {
-    activeSession.value = sessions.value[Math.min(closedIndex, sessions.value.length - 1)]?.session_id || null
-  }
-
-  setTimeout(() => {
-    try { ws?.close() } catch (e) {}
-    try { term?.dispose() } catch (e) {}
-  }, 0)
+  removeLocalSession(id)
 
   let deleteFailed = false
   try {

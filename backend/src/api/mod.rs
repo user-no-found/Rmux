@@ -411,6 +411,16 @@ const INITIAL_SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 /// 空闲连接会被反向代理按读超时掐断，而两端都不会收到通知：终端看着还在，
 /// 输出却永远不再送达。定期 Ping 既保活也能尽早发现死连接。
 const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// 浏览器 xterm 与跨设备恢复都保留最近 5000 行，避免两个历史上限不一致。
+const TERMINAL_HISTORY_LINES: usize = 5000;
+
+async fn forget_gone_session(state: &AppState, session_id: &str) {
+    let removed = state.sessions.write().await.remove(session_id).is_some();
+    terminal::release_attach(&state.attaches, session_id).await;
+    if removed {
+        persist_sessions(state).await;
+    }
+}
 
 /// tmux 一 attach 就会按当前 PTY 尺寸整屏重绘。若此时浏览器还没报告真实尺寸，
 /// 这一屏就画在错误的网格上，而之后 tmux 只发增量更新 —— 基线错了就再也回不来，
@@ -486,9 +496,44 @@ async fn handle_terminal_resume(
         return;
     };
 
+    // 同一条 tmux command queue 先验证 session，再刷新浏览器相关选项。若会话已经
+    // 退出，这里会直接失败，不会像旧实现那样由 set-option 启动空 server，随后把
+    // `no sessions` 输出到终端。
+    if let Err(e) = terminal::prepare_tmux_session(&state.config, &session_id, &tmux_name).await {
+        warn!("准备 tmux 会话失败: {}", e);
+        if !terminal::check_tmux_session(&state.config, &session_id, &tmux_name).await {
+            forget_gone_session(&state, &session_id).await;
+            let _ = ws.send(Message::Text("SESSION_GONE".into())).await;
+            return;
+        }
+    }
+
     // 登记要放在 attach 之前：attach 带 `-d`，会顶掉上一个客户端，
     // 上一个必须先收到"被接管"的通知，才不会转头又重连回来。
     let mut replaced = terminal::claim_attach(&state.attaches, &session_id).await;
+
+    // 新浏览器没有旧 xterm buffer。先从 tmux 抓取当前屏幕之前的持久历史；attach
+    // 随后只负责重绘当前屏幕，两部分按 WebSocket 顺序拼起来即可完整恢复。
+    let history = match terminal::capture_tmux_history(
+        &state.config,
+        &session_id,
+        &tmux_name,
+        TERMINAL_HISTORY_LINES,
+        clamp_axis(size.rows),
+    )
+    .await
+    {
+        Ok(history) => history,
+        Err(e) => {
+            warn!("恢复 tmux 历史失败: {}", e);
+            if !terminal::check_tmux_session(&state.config, &session_id, &tmux_name).await {
+                forget_gone_session(&state, &session_id).await;
+                let _ = ws.send(Message::Text("SESSION_GONE".into())).await;
+                return;
+            }
+            Vec::new()
+        }
+    };
 
     let terminal::PtyIo {
         mut output,
@@ -516,6 +561,12 @@ async fn handle_terminal_resume(
     if let Some(s) = state.sessions.write().await.get_mut(&session_id) {
         s.size = size;
         s.last_activity = chrono::Utc::now().to_rfc3339();
+    }
+
+    // 必须在读取 live PTY queue 前发历史快照，WebSocket 才能保证客户端先建立
+    // scrollback、再处理 tmux 的清屏和当前屏幕重绘。
+    if !history.is_empty() && ws.send(Message::Binary(history.into())).await.is_err() {
+        return;
     }
 
     for data in pending_input {
@@ -555,10 +606,13 @@ async fn handle_terminal_resume(
                     None => {
                         // PTY 读到 EOF：tmux 客户端退出了。可能是会话真的结束，
                         // 也可能只是被同会话的新客户端顶掉，两者要区别对待。
-                        if !terminal::check_tmux_session(&state.config, &session_id, &tmux_name).await {
-                            state.sessions.write().await.remove(&session_id);
-                            terminal::release_attach(&state.attaches, &session_id).await;
-                            persist_sessions(&state).await;
+                        // 新 attach 会让旧 tmux client 先 EOF，watch 通知也几乎同时到；
+                        // select 若抢先选到 EOF，仍要检查代号，不能让旧浏览器自动重连
+                        // 后再次顶掉新电脑。
+                        if replaced.has_changed().unwrap_or(false) {
+                            let _ = ws.send(Message::Text("SESSION_REPLACED".into())).await;
+                        } else if !terminal::check_tmux_session(&state.config, &session_id, &tmux_name).await {
+                            forget_gone_session(&state, &session_id).await;
                             let _ = ws.send(Message::Text("SESSION_GONE".into())).await;
                         }
                         break;

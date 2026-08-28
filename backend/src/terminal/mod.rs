@@ -129,6 +129,11 @@ fn shell_quote(value: &str) -> String {
 /// 浏览器端通过真 PTY 直连 tmux 客户端，因此 tmux 必须对按键完全透明。
 /// 最关键的是关掉前缀键：输入不再走 `send-keys -l` 字面量注入，
 /// 若保留默认 C-b，readline 的 backward-char 和大量 CLI 快捷键都会被 tmux 截走。
+///
+/// tmux 默认会让外层终端进入 alternate screen。xterm.js 的 alternate buffer 没有
+/// scrollback，滚轮会被转换成上下方向键，于是 shell 开始翻输入历史而不是终端输出。
+/// 去掉外层 xterm 的 smcup/rmcup 后，tmux 仍照常绘制，但输出会留在浏览器的正常
+/// buffer 中；mouse 继续保持 off，原生右键菜单和拖选复制也不会被 tmux 接管。
 const TMUX_CONF: &str = r#"# 由 Rmux 自动生成，请勿手工编辑。
 set -g prefix None
 set -g prefix2 None
@@ -136,6 +141,7 @@ set -g status off
 set -sg escape-time 0
 set -g history-limit 10000
 set -g mouse off
+set -g terminal-overrides "xterm-256color:smcup@:rmcup@"
 set -g default-terminal "tmux-256color"
 set -as terminal-features ",xterm-256color:RGB"
 set -g window-size latest
@@ -281,6 +287,167 @@ pub async fn check_tmux_session(config: &AppConfig, session_id: &str, session_na
     .await
     .map(|o| o.status.success())
     .unwrap_or(false)
+}
+
+/// 在 attach 前刷新影响浏览器交互的 tmux server 选项。
+///
+/// `has-session` 必须是同一条 tmux command queue 的第一项。若 socket 已失效或
+/// session 已经退出，tmux 会在这里停止，不会为了后面的 `set-option` 启动一个
+/// 没有 session 的空 server。旧实现把 set-option 放在 attach 前面，失效会话会
+/// 因此向浏览器输出 `no sessions`，并留下一个短命的空 tmux server。
+pub async fn prepare_tmux_session(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+) -> Result<(), String> {
+    let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
+    let mut cmd = tokio::process::Command::new(config.tmux_path());
+    if let Some(lib) = config.tmux_lib_dir() {
+        cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    cmd.args([
+        "-u",
+        "-S",
+        &socket.display().to_string(),
+        "has-session",
+        "-t",
+        session_name,
+        ";",
+        "set-option",
+        "-g",
+        "mouse",
+        "off",
+        ";",
+        "set-option",
+        "-g",
+        "terminal-overrides",
+        "xterm-256color:smcup@:rmcup@",
+    ]);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("准备 tmux 会话失败: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if detail.is_empty() {
+            "tmux 会话不存在".into()
+        } else {
+            detail
+        })
+    }
+}
+
+/// 新浏览器本身没有旧 xterm scrollback；tmux 却仍保存着 pane history。
+/// 抓取 tmux 当前可见屏幕之前的最近若干行，在实时 attach 重绘之前回放给浏览器，
+/// 这样换电脑或 WebSocket 重连后仍能向上翻阅。当前可见屏幕由 attach 自己重绘，
+/// 故 capture 的结束位置固定为 -1，避免把当前屏幕重复塞进历史。
+pub async fn capture_tmux_history(
+    config: &AppConfig,
+    session_id: &str,
+    session_name: &str,
+    limit: usize,
+    viewport_rows: u16,
+) -> Result<Vec<u8>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let socket = config.socket_path.join(format!("tmux_{}.sock", session_id));
+    let socket_str = socket.display().to_string();
+    let tmux_bin = config.tmux_path();
+
+    let mut size_cmd = tokio::process::Command::new(&tmux_bin);
+    if let Some(lib) = config.tmux_lib_dir() {
+        size_cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    size_cmd.args([
+        "-u",
+        "-S",
+        &socket_str,
+        "display-message",
+        "-p",
+        "-t",
+        session_name,
+        "#{history_size}",
+    ]);
+    let size_output = size_cmd
+        .output()
+        .await
+        .map_err(|e| format!("读取 tmux 历史长度失败: {}", e))?;
+    if !size_output.status.success() {
+        return Err(String::from_utf8_lossy(&size_output.stderr)
+            .trim()
+            .to_string());
+    }
+    let available = String::from_utf8_lossy(&size_output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| format!("解析 tmux 历史长度失败: {}", e))?;
+    let lines = available.min(limit);
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+
+    let start = format!("-{}", lines);
+    let mut capture_cmd = tokio::process::Command::new(tmux_bin);
+    if let Some(lib) = config.tmux_lib_dir() {
+        capture_cmd.env("LD_LIBRARY_PATH", lib);
+    }
+    capture_cmd.args([
+        "-u",
+        "-S",
+        &socket_str,
+        "capture-pane",
+        "-p",
+        "-e",
+        "-S",
+        &start,
+        "-E",
+        "-1",
+        "-t",
+        session_name,
+    ]);
+    let capture_output = capture_cmd
+        .output()
+        .await
+        .map_err(|e| format!("抓取 tmux 历史失败: {}", e))?;
+    if !capture_output.status.success() {
+        return Err(String::from_utf8_lossy(&capture_output.stderr)
+            .trim()
+            .to_string());
+    }
+
+    Ok(history_snapshot_for_terminal(
+        &capture_output.stdout,
+        viewport_rows,
+    ))
+}
+
+/// capture-pane 使用 LF 分行，而 xterm 在 convertEol=false 时需要 CRLF 才会回到首列。
+/// 抓取内容写完后再补 rows-1 个空行，把最后一屏也推入 scrollback；紧随其后的
+/// tmux attach 会清屏并重绘这些空行所在的当前 viewport，不会抹掉刚恢复的历史。
+fn history_snapshot_for_terminal(captured: &[u8], viewport_rows: u16) -> Vec<u8> {
+    let padding = viewport_rows.saturating_sub(1) as usize;
+    let mut output = Vec::with_capacity(captured.len() + (padding + 1) * 2 + 4);
+    let mut previous = None;
+    for &byte in captured {
+        if byte == b'\n' && previous != Some(b'\r') {
+            output.push(b'\r');
+        }
+        output.push(byte);
+        previous = Some(byte);
+    }
+    if !captured.ends_with(b"\n") {
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b"\x1b[0m");
+    for _ in 0..padding {
+        output.extend_from_slice(b"\r\n");
+    }
+    output
 }
 
 // ─── 会话创建 ───────────────────────────────────────────────────────────
@@ -458,20 +625,15 @@ pub fn attach_pty_session(
 
     // `-d` 顶掉同会话的其它客户端：任一时刻只有一个客户端，
     // 尺寸永远等于当前浏览器窗口，不会出现多客户端互相压缩导致的重排抖动。
-    // `-f` 只在 tmux server 首次启动时生效；恢复出来的旧 server 不会重读配置。
-    // attach 前显式关闭 tmux 鼠标捕获，现有会话也会立即恢复浏览器的原生
-    // 右键菜单和 xterm 本地选择；否则右键会打开 tmux 菜单，拖选也会在松手时取消。
+    // server 选项和 session 存活校验已由 prepare_tmux_session 原子完成；这里不能
+    // 再把 set-option 放在 attach 前面，否则失效 socket 会被启动成没有 session 的
+    // 空 server，并把 `no sessions` 直接画进浏览器。
     let args: Vec<String> = vec![
         "-f".into(),
         conf.display().to_string(),
         "-u".into(),
         "-S".into(),
         socket.display().to_string(),
-        "set-option".into(),
-        "-g".into(),
-        "mouse".into(),
-        "off".into(),
-        ";".into(),
         "attach-session".into(),
         "-d".into(),
         "-t".into(),
@@ -689,4 +851,25 @@ pub async fn kill_tmux_session(
         info!("已杀死会话并清理 socket: {}", session_name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::history_snapshot_for_terminal;
+
+    #[test]
+    fn history_snapshot_uses_crlf_and_pushes_last_screen_into_scrollback() {
+        assert_eq!(
+            history_snapshot_for_terminal(b"first\nsecond\n", 3),
+            b"first\r\nsecond\r\n\x1b[0m\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn history_snapshot_does_not_duplicate_existing_carriage_returns() {
+        assert_eq!(
+            history_snapshot_for_terminal(b"first\r\nsecond", 1),
+            b"first\r\nsecond\r\n\x1b[0m"
+        );
+    }
 }

@@ -29,7 +29,6 @@ if ! echo "$VERSION" | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
     exit 1
 fi
 
-ICON_TAG="v${VERSION//./_}"
 echo "📦 版本: $VERSION"
 
 # Step 1: 编译 Rust 后端
@@ -40,13 +39,6 @@ mkdir -p "${ICON_DIR}"
 find "${ICON_DIR}" -maxdepth 1 -type f -name '*.png' -delete
 rm -f "${BUILD_DIR}/ICON.PNG" "${BUILD_DIR}/ICON_256.PNG" "${BUILD_DIR}/app/www/icon.png"
 python3 "${SCRIPT_DIR}/scripts/generate_icons.py"
-for size in 16 24 32 48 64 72 96 128 256; do
-    cp "${ICON_DIR}/rmux_${size}.png" "${ICON_DIR}/rmux_${ICON_TAG}_${size}.png"
-    cp "${ICON_DIR}/icon_${size}.png" "${ICON_DIR}/icon_${ICON_TAG}_${size}.png"
-done
-cp "${ICON_DIR}/rmux_{0}.png" "${ICON_DIR}/rmux_${ICON_TAG}_{0}.png"
-cp "${ICON_DIR}/icon_{0}.png" "${ICON_DIR}/icon_${ICON_TAG}_{0}.png"
-sed -i -E "s|\"icon\": \"images/rmux([^\\\"]*)\\{0\\}\\.png\"|\"icon\": \"images/rmux_${ICON_TAG}_{0}.png\"|g" "${BUILD_DIR}/app/ui/config"
 sed -i -E "s|\"url\": \"/app/rmux/[^\\\"]*\"|\"url\": \"/app/rmux/?v=${VERSION}\"|g" "${BUILD_DIR}/app/ui/config"
 echo "  ✅ 图标已重新生成"
 
