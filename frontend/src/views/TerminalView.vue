@@ -12,7 +12,7 @@
             @click="switchSession(s.session_id)"
             @keydown.enter.prevent="switchSession(s.session_id)"
           >
-            <span :class="['status-dot', dotClass(index)]"></span>
+            <span :class="['status-dot', dotClass(s.session_id)]"></span>
             <input
               v-if="editingSession === s.session_id"
               :ref="el => setRenameInputRef(s.session_id, el)"
@@ -120,10 +120,12 @@ import { computed, ref, reactive, onMounted, onBeforeUnmount, nextTick, watch } 
 import { useRouter } from 'vue-router'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
+import { WebLinksAddon } from 'xterm-addon-web-links'
 import { WebglAddon } from 'xterm-addon-webgl'
 import 'xterm/css/xterm.css'
 import axios from 'axios'
 import { API_BASE, WS_BASE } from '../runtimeBase'
+import { registerHardWrappedUrlLinks } from '../terminalLinks'
 
 const router = useRouter()
 
@@ -140,6 +142,7 @@ const reconnectTimers = {}
 const reconnectAttempts = {}
 const attachedOnce = {}
 const deadSessions = {}
+const closingSessions = new Set()
 const toastMsg = ref('')
 const systemInfo = ref({ hostname: 'localhost', os: 'Linux', arch: 'x86_64' })
 const repoHref = 'https://github.com/user-no-found/Rmux'
@@ -150,6 +153,19 @@ const editingName = ref('')
 const renameInputRefs = reactive({})
 
 const dotClasses = ['online', 'blue', 'purple', 'orange']
+const SESSION_DOT_STORAGE_KEY = 'rmux_session_dot_classes'
+const storedSessionDotClasses = (() => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SESSION_DOT_STORAGE_KEY) || '{}')
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return {}
+    return Object.fromEntries(
+      Object.entries(stored).filter(([, value]) => dotClasses.includes(value)),
+    )
+  } catch (e) {
+    return {}
+  }
+})()
+const sessionDotClasses = reactive(storedSessionDotClasses)
 const CLIPBOARD_HISTORY_LIMIT = 20
 const MAX_TEXT_HISTORY_CHARS = 100000
 const SESSION_REFRESH_MS = 15000
@@ -286,7 +302,39 @@ const activeMeta = computed(() => {
   return `${host}${size ? ` · ${size.cols}x${size.rows}` : ''}`
 })
 
-const dotClass = (index) => dotClasses[index % dotClasses.length]
+const saveSessionDotClasses = () => {
+  try {
+    localStorage.setItem(SESSION_DOT_STORAGE_KEY, JSON.stringify(sessionDotClasses))
+  } catch (e) {}
+}
+
+const assignSessionDotClasses = (items) => {
+  const liveIds = new Set([
+    ...items.map(session => session.session_id),
+    ...closingSessions,
+  ])
+  Object.keys(sessionDotClasses).forEach((id) => {
+    if (!liveIds.has(id)) delete sessionDotClasses[id]
+  })
+
+  const usage = Object.fromEntries(dotClasses.map(color => [color, 0]))
+  items.forEach((session) => {
+    const color = sessionDotClasses[session.session_id]
+    if (color) usage[color] += 1
+  })
+
+  items.forEach((session) => {
+    if (sessionDotClasses[session.session_id]) return
+    const color = dotClasses.reduce((best, candidate) => (
+      usage[candidate] < usage[best] ? candidate : best
+    ), dotClasses[0])
+    sessionDotClasses[session.session_id] = color
+    usage[color] += 1
+  })
+  saveSessionDotClasses()
+}
+
+const dotClass = (sessionId) => sessionDotClasses[sessionId] || dotClasses[0]
 
 const sessionTitle = (session, index) => {
   if (session?.name) return session.name
@@ -365,6 +413,7 @@ const mergeSessionList = (incoming) => {
 const appendSession = (session) => {
   if (!sessions.value.some(s => s.session_id === session.session_id)) {
     sessions.value.push(session)
+    assignSessionDotClasses(sessions.value)
   }
 }
 
@@ -631,7 +680,9 @@ const loadSessions = async () => {
   try {
     const res = await axios.get(`${API_BASE}/api/sessions`, authHeaders())
     if (res.data.success) {
-      sessions.value = mergeSessionList(res.data.data)
+      const incoming = res.data.data.filter(session => !closingSessions.has(session.session_id))
+      sessions.value = mergeSessionList(incoming)
+      assignSessionDotClasses(sessions.value)
       if (sessions.value.length > 0 && !activeSession.value) {
         activeSession.value = sessions.value[0].session_id
       } else if (activeSession.value && !sessions.value.some(s => s.session_id === activeSession.value)) {
@@ -842,7 +893,8 @@ const initTerminal = async (id) => {
   term.loadAddon(fitAddon)
   term.open(el)
   loadWebglRenderer(term)
-  registerUrlLinks(term)
+  registerHardWrappedUrlLinks(term, (_event, url) => openSafeUrl(url))
+  term.loadAddon(new WebLinksAddon((_event, url) => openSafeUrl(url)))
 
   termInstances[id] = term
   fitAddons[id] = fitAddon
@@ -863,18 +915,6 @@ const initTerminal = async (id) => {
   // 决定了之后所有增量更新对不对得上。
   applyFit(id)
   connectTerminal(id)
-
-  const termViewport = el.querySelector('.xterm-viewport') || el
-  termViewport.addEventListener('contextmenu', async (e) => {
-    e.preventDefault()
-    if (term.hasSelection()) {
-      await navigator.clipboard.writeText(term.getSelection())
-      term.clearSelection()
-      showToast('已复制')
-    } else {
-      await pasteClipboard(id)
-    }
-  })
 
   term.attachCustomKeyEventHandler((e) => {
     if (handlePasteShortcut(e, id)) {
@@ -952,27 +992,51 @@ const createNewSession = async () => {
 }
 
 const closeSession = async (id) => {
-  try {
-    await axios.delete(`${API_BASE}/api/sessions/${id}`, authHeaders())
-  } catch (e) {}
-  // 先标记再拆，否则 close 触发的 onclose 会把连接重新拉起来。
+  if (closingSessions.has(id)) return
+  closingSessions.add(id)
+
+  const closedIndex = sessions.value.findIndex(session => session.session_id === id)
+  const ws = wsConnections[id]
+  const term = termInstances[id]
+
+  // 先更新渲染状态并摘掉连接引用。WebSocket / WebGL / xterm 的 dispose 可能
+  // 同步释放大量缓冲区，放到下一轮事件循环，避免它挡住当前点击的标签重绘。
+  // dead 标记必须先设，否则稍后 close 触发的 onclose 会把连接重新拉起来。
   deadSessions[id] = true
   clearReconnect(id)
-  if (wsConnections[id]) {
-    wsConnections[id].close()
-    delete wsConnections[id]
-  }
-  if (termInstances[id]) {
-    termInstances[id].dispose()
-    delete termInstances[id]
-  }
-  if (fitAddons[id]) delete fitAddons[id]
+  delete wsConnections[id]
+  delete termInstances[id]
+  delete fitAddons[id]
   delete termRefs[id]
+  delete renameInputRefs[id]
   delete lastSentSize[id]
   delete reconnectAttempts[id]
   delete attachedOnce[id]
-  sessions.value = sessions.value.filter(s => s.session_id !== id)
-  if (activeSession.value === id) activeSession.value = sessions.value[0]?.session_id || null
+  sessions.value = sessions.value.filter(session => session.session_id !== id)
+  if (editingSession.value === id) cancelRename()
+  if (activeSession.value === id) {
+    activeSession.value = sessions.value[Math.min(closedIndex, sessions.value.length - 1)]?.session_id || null
+  }
+
+  setTimeout(() => {
+    try { ws?.close() } catch (e) {}
+    try { term?.dispose() } catch (e) {}
+  }, 0)
+
+  let deleteFailed = false
+  try {
+    await axios.delete(`${API_BASE}/api/sessions/${id}`, authHeaders())
+    delete sessionDotClasses[id]
+    saveSessionDotClasses()
+  } catch (e) {
+    deleteFailed = true
+    showToast('关闭失败: ' + (e.response?.data?.message || e.message || '网络错误'))
+  } finally {
+    closingSessions.delete(id)
+  }
+
+  // 网络失败时以服务端状态为准：仍存活的会话会重新出现并可再次连接。
+  if (deleteFailed) await loadSessions()
 }
 
 const beginRename = async (session) => {
@@ -1016,56 +1080,6 @@ const openSafeUrl = (raw) => {
   const url = String(raw || '').replace(/[),.;:!?]+$/g, '')
   if (!/^https?:\/\//i.test(url)) return
   window.open(url, '_blank', 'noopener,noreferrer')
-}
-
-const registerUrlLinks = (term) => {
-  const urlPattern = /\bhttps?:\/\/[^\s<>"'`]+/gi
-  term.registerLinkProvider({
-    provideLinks(bufferLineNumber, callback) {
-      const line = term.buffer.active.getLine(bufferLineNumber - 1)
-      const text = line?.translateToString(true) || ''
-      const links = []
-      for (const match of text.matchAll(urlPattern)) {
-        const raw = match[0]
-        const url = raw.replace(/[),.;:!?]+$/g, '')
-        if (!url) continue
-        const start = (match.index || 0) + 1
-        const end = start + url.length - 1
-        links.push({
-          range: {
-            start: { x: start, y: bufferLineNumber },
-            end: { x: end, y: bufferLineNumber },
-          },
-          text: url,
-          decorations: { pointerCursor: true, underline: true },
-          activate: (_event, value) => openSafeUrl(value),
-        })
-      }
-      callback(links.length ? links : undefined)
-    },
-  })
-}
-
-const pasteClipboard = async (sessionId = activeSession.value) => {
-  try {
-    if (navigator.clipboard?.read) {
-      const items = await navigator.clipboard.read()
-      for (const item of items) {
-        const imageType = item.types.find(type => type.startsWith('image/'))
-        if (imageType) {
-          await pasteImageBlob(await item.getType(imageType), { sessionId })
-          return
-        }
-      }
-    }
-
-    if (navigator.clipboard?.readText) {
-      const text = await navigator.clipboard.readText()
-      pasteText(text, { sessionId })
-    }
-  } catch (e) {
-    showToast('粘贴失败: ' + (e.response?.data?.message || e.message || '请使用浏览器粘贴'))
-  }
 }
 
 const pasteClipboardHistoryItem = (item) => {

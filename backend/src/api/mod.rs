@@ -377,10 +377,13 @@ async fn delete_session(
 
     match removed {
         Some(s) => {
+            // 先移除 attach 代号：关联 WebSocket 会从 changed() 分支退出，
+            // PtyControl 随之析构并杀掉 attach 子进程，读/写/wait 三个线程也会收到
+            // EOF、通道关闭或子进程退出。之后再杀持久 tmux 会话，销毁顺序更确定。
+            terminal::release_attach(&state.attaches, &session_id).await;
             let _ =
                 terminal::kill_tmux_session(&state.config, &session_id, &s.tmux_session_name, true)
                     .await;
-            terminal::release_attach(&state.attaches, &session_id).await;
             persist_sessions(&state).await;
             Json(ApiResponse::ok(serde_json::json!({})))
         }

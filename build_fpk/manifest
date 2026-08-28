@@ -1,5 +1,5 @@
 appname               = rmux
-version               = 0.0.4
+version               = 0.0.5
 display_name          = Rmux
 desc                  = Web 终端管理，会话持久化，主题自定义
 platform              = x86
